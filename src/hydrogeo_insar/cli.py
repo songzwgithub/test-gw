@@ -5,6 +5,7 @@ import json
 
 from .config import load_config
 from .pipeline import STAGES, run_pipeline, run_stage
+from .visualization import PLOT_STAGES, plot_all, plot_stage
 
 
 def main(argv=None) -> int:
@@ -18,13 +19,21 @@ def main(argv=None) -> int:
     p = sub.add_parser("stage", help="Run one stage")
     p.add_argument("config")
     p.add_argument("stage", choices=list(STAGES))
+    p = sub.add_parser("plot", help="Generate result-check figures from existing outputs")
+    p.add_argument("config")
+    p.add_argument("--stage", choices=["all", *PLOT_STAGES], default="all")
     sub.add_parser("list-stages")
     args = parser.parse_args(argv)
     if args.command == "list-stages":
         print("\n".join(STAGES)); return 0
     cfg = load_config(args.config)
     try:
-        result = run_stage(cfg, args.stage) if args.command == "stage" else run_pipeline(cfg, start=args.start, stop=args.stop, only=args.only)
+        if args.command == "plot":
+            result = plot_all(cfg) if args.stage == "all" else plot_stage(cfg, args.stage)
+        elif args.command == "stage":
+            result = run_stage(cfg, args.stage)
+        else:
+            result = run_pipeline(cfg, start=args.start, stop=args.stop, only=args.only)
         print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
         return 0
     except Exception as exc:

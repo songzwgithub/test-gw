@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from hydrogeo_insar.hydromechanics.seasonal import rotate_coefficients
+from hydrogeo_insar.groundwater.field import _supported_interpolation_mask
 from hydrogeo_insar.temporal.fit import fit_block
 from hydrogeo_insar.temporal.model import TimeModel, calendar_year_knots, design_matrix, low_frequency_row
 
@@ -50,3 +51,10 @@ def test_storage_identity_scalar():
     recoverable = 0.02
     irreversible = total - recoverable
     assert np.isclose(total, recoverable + irreversible)
+
+
+def test_groundwater_long_temporal_gap_is_not_bridged():
+    src = np.asarray(["2020-01-01", "2020-01-10", "2020-04-20", "2020-04-30"], dtype="datetime64[D]")
+    qry = np.asarray(["2020-01-05", "2020-02-15", "2020-04-25"], dtype="datetime64[D]")
+    keep = _supported_interpolation_mask(src, qry, max_gap_days=30)
+    assert keep.tolist() == [True, False, True]

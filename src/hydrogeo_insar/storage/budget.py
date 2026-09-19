@@ -37,13 +37,14 @@ def _storage_domain(cfg: ProjectConfig, dates, i_idx, h_idx, grid):
     return domain, ske
 
 
-def _raw_cumulative_series(cfg, dates, i_idx, h_idx, domain, ske, area2, ib, clusters):
+def _raw_cumulative_series(cfg, dates, i_idx, h_idx, domain, ske, area2, ib, ie, clusters):
     rows, cluster_rows = [], []
     unique_clusters = [] if clusters is None else sorted(int(v) for v in np.unique(clusters[domain]) if v > 0)
     with h5py.File(cfg.outputs / "canonical" / "insar_stack.h5", "r") as ih5, h5py.File(cfg.outputs / "groundwater" / "groundwater_field.h5", "r") as hh5:
         disp0 = ih5["displacement_mm"][i_idx[ib]].astype(float)
         head0 = hh5["head_anomaly_m"][h_idx[ib]].astype(float)
-        for k, date in enumerate(dates):
+        for k in range(ib, ie + 1):
+            date = dates[k]
             disp = ih5["displacement_mm"][i_idx[k]].astype(float)
             head = hh5["head_anomaly_m"][h_idx[k]].astype(float)
             dtot = (disp - disp0) / 1000.0
@@ -102,9 +103,9 @@ def compute_storage_budget(cfg: ProjectConfig) -> dict[str, Any]:
     ib = _nearest_index(dates, sec.get("baseline_date"), 0)
     ie = _nearest_index(dates, sec.get("end_date"), len(dates) - 1)
     if ie < ib:
-        ib, ie = ie, ib
+        raise ValueError("storage.end_date precedes storage.baseline_date")
 
-    observed_ts, observed_clusters = _raw_cumulative_series(cfg, dates, i_idx, h_idx, domain, ske, area2, ib, clusters)
+    observed_ts, observed_clusters = _raw_cumulative_series(cfg, dates, i_idx, h_idx, domain, ske, area2, ib, ie, clusters)
     observed_ts.to_csv(out_dir / "storage_cumulative_observed.csv", index=False)
     if not observed_clusters.empty:
         observed_clusters.to_csv(out_dir / "storage_cumulative_observed_by_cluster.csv", index=False)
@@ -120,12 +121,12 @@ def compute_storage_budget(cfg: ProjectConfig) -> dict[str, Any]:
     x1 = low_frequency_row(final_end, model, dates[0])
     dx_final = x1 - x0
 
-    years = range(int(str(dates[0])[:4]), int(str(dates[-1])[:4]) + 1)
+    years = range(int(str(final_start)[:4]), int(str(final_end)[:4]) + 1)
     intervals = []
     for year in years:
         y0 = np.datetime64(f"{year}-01-01", "D")
         y1 = np.datetime64(f"{year + 1}-01-01", "D")
-        start = max(y0, dates[0]); end = min(y1, dates[-1])
+        start = max(y0, final_start); end = min(y1, final_end)
         if end > start:
             intervals.append((year, start, end, bool(start == y0 and end == y1), low_frequency_row(end, model, dates[0]) - low_frequency_row(start, model, dates[0])))
 

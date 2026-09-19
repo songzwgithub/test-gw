@@ -40,6 +40,7 @@ groundwater_field:
   max_gap_days: 7
   min_coverage_fraction: 0.50
   min_active_well_fraction: 0.50
+  max_temporal_interpolation_gap_days: 60
   min_baseline_observations: 6
   coordinate_tolerance_deg: 0.00001
   svd_iterations: 20
@@ -106,6 +107,7 @@ ske:
   basis_sigma_factor: 1.5
   max_basis_neighbors: 12
   max_extrapolation_km: 30
+  min_vector_cosine: 0.0
   lambda_candidates: [0.1, 1.0, 10.0, 100.0]
   cv_block_km: 30
   aggregation_block_size: 256
@@ -141,3 +143,8 @@ extensometer:
     depth_top_m: depth_top_m
     depth_bottom_m: depth_bottom_m
     compaction_mm: compaction_mm
+
+visualization:
+  dpi: 180
+  max_display_pixels: 1400
+  output_directory: outputs/figures/checks

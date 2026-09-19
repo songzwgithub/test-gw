@@ -331,6 +331,40 @@ def _support_mask_points(points_xy: np.ndarray, query_xy: np.ndarray, max_distan
     return inside
 
 
+def _supported_interpolation_mask(
+    source_dates: np.ndarray,
+    query_dates: np.ndarray,
+    max_gap_days: int | None,
+) -> np.ndarray:
+    """Allow interpolation only across supported temporal gaps.
+
+    Exact source dates are always supported. Interpolation between two source
+    dates is allowed only when their separation does not exceed
+    ``max_gap_days``. This prevents long periods rejected by the active-well
+    criterion from being silently bridged later by ``np.interp``.
+    """
+    src = np.asarray(source_dates, dtype="datetime64[D]").astype(np.int64)
+    qry = np.asarray(query_dates, dtype="datetime64[D]").astype(np.int64)
+    if len(src) == 0:
+        return np.zeros(len(qry), dtype=bool)
+    if max_gap_days is None:
+        return (qry >= src[0]) & (qry <= src[-1])
+
+    pos = np.searchsorted(src, qry, side="left")
+    exact = np.zeros(len(qry), dtype=bool)
+    inside_pos = pos < len(src)
+    exact[inside_pos] = src[pos[inside_pos]] == qry[inside_pos]
+
+    left = pos - 1
+    right = pos
+    bracketed = (left >= 0) & (right < len(src))
+    allowed = exact.copy()
+    if bracketed.any():
+        gap = src[right[bracketed]] - src[left[bracketed]]
+        allowed[bracketed] |= gap <= int(max_gap_days)
+    return allowed
+
+
 def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
     dates, matrix, meta, bstart, bend = _prepare_well_matrix(cfg)
     sec = cfg.section("groundwater_field")
@@ -361,7 +395,11 @@ def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
     with h5py.File(insar_path, "r") as ih5:
         all_insar_dates = days_to_dates(ih5["date_days"][:])
     gw_start, gw_end = model.temporal_dates[0], model.temporal_dates[-1]
-    obs_dates = all_insar_dates[(all_insar_dates >= gw_start) & (all_insar_dates <= gw_end)]
+    candidate_dates = all_insar_dates[(all_insar_dates >= gw_start) & (all_insar_dates <= gw_end)]
+    max_temporal_gap = sec.get("max_temporal_interpolation_gap_days", 60)
+    max_temporal_gap = None if max_temporal_gap is None else int(max_temporal_gap)
+    temporal_support = _supported_interpolation_mask(model.temporal_dates, candidate_dates, max_temporal_gap)
+    obs_dates = candidate_dates[temporal_support]
     if len(obs_dates) < 12:
         raise ValueError("Too few InSAR epochs overlap the groundwater temporal support")
     src_days = model.temporal_dates.astype("datetime64[D]").astype(np.int64)
@@ -445,6 +483,7 @@ def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
         "first_supported_date": str(obs_dates[0]),
         "last_supported_date": str(obs_dates[-1]),
         "epochs": len(obs_dates),
+        "max_temporal_interpolation_gap_days": max_temporal_gap,
         "support_pixels": int(support_full.sum()),
         "cv_rmse_m": float(best["cv_rmse_m"]),
         "cv_annual_amplitude_rmse_m": float(best["cv_annual_amplitude_rmse_m"]),

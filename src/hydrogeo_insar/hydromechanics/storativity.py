@@ -208,13 +208,29 @@ def estimate_regularized_ske(cfg: ProjectConfig) -> dict[str, Any]:
 
     hamp = np.hypot(rhs, rhc)
     damp = np.hypot(ds, dc)
-    quality = 1.0 / (1.0 + (drmse / np.maximum(damp, 1e-9)) ** 2 + (hrmse / np.maximum(hamp, 1e-9)) ** 2)
+    gw_summary = json.loads((cfg.outputs / "groundwater" / "groundwater_field_summary.json").read_text(encoding="utf-8"))
+    gw_cv_harmonic_rmse = float(gw_summary.get("cv_harmonic_vector_rmse_m", 0.0))
+    if not np.isfinite(gw_cv_harmonic_rmse) or gw_cv_harmonic_rmse < 0:
+        gw_cv_harmonic_rmse = 0.0
+    head_sigma = np.sqrt(hrmse * hrmse + gw_cv_harmonic_rmse * gw_cv_harmonic_rmse)
+
+    dot = ds * rhs + dc * rhc
+    vector_cosine = dot / np.maximum(damp * hamp, 1e-12)
+    coupling = np.clip(vector_cosine, 0.0, 1.0)
+    quality = 1.0 / (
+        1.0
+        + (drmse / np.maximum(damp, 1e-9)) ** 2
+        + (head_sigma / np.maximum(hamp, 1e-9)) ** 2
+    )
+    quality *= coupling
     q2 = quality * (rhs * rhs + rhc * rhc)
-    qd = quality * (ds * rhs + dc * rhc)
+    qd = quality * dot
     d2 = quality * (ds * ds + dc * dc)
 
     sresp = cfg.section("seasonal_response")
+    min_vector_cosine = float(sec.get("min_vector_cosine", 0.0))
     data_valid = np.isfinite(q2) & np.isfinite(qd) & np.isfinite(d2) & np.isfinite(quality)
+    data_valid &= np.isfinite(vector_cosine) & (vector_cosine > min_vector_cosine)
     data_valid &= hamp >= float(sresp.get("min_head_amplitude_m", 0.2))
     data_valid &= damp * 1000.0 >= float(sresp.get("min_deformation_amplitude_mm", 0.5))
     gw_support = read_tif(cfg.outputs / "groundwater" / "groundwater_support_mask.tif") > 0
@@ -222,7 +238,6 @@ def estimate_regularized_ske(cfg: ProjectConfig) -> dict[str, Any]:
 
     with rasterio.open(seasonal / "head_annual_sin_m.tif") as ref:
         transform = ref.transform; grid_crs = str(ref.crs); height = ref.height; width = ref.width
-    gw_summary = json.loads((cfg.outputs / "groundwater" / "groundwater_field_summary.json").read_text(encoding="utf-8"))
     projected_crs = str(gw_summary["projected_crs"])
 
     obs = _aggregate_observations(
@@ -249,6 +264,7 @@ def estimate_regularized_ske(cfg: ProjectConfig) -> dict[str, Any]:
     raw = np.full_like(ds, np.nan, dtype=float)
     raw[data_valid] = qd[data_valid] / np.maximum(q2[data_valid], 1e-12)
     write_tif(out_dir / "ske_raw_ratio.tif", raw.astype("float32"), grid_crs, transform)
+    write_tif(out_dir / "seasonal_vector_cosine.tif", vector_cosine.astype("float32"), grid_crs, transform)
     write_tif(out_dir / "ske_data_support_mask.tif", data_valid.astype("uint8"), grid_crs, transform, nodata=0, dtype="uint8")
 
     ske = np.full((height, width), np.nan, dtype="float32")
@@ -286,6 +302,8 @@ def estimate_regularized_ske(cfg: ProjectConfig) -> dict[str, Any]:
         "node_spacing_km": spacing_km,
         "basis_sigma_factor": sigma_factor,
         "max_extrapolation_km": max_extrap,
+        "min_vector_cosine": min_vector_cosine,
+        "groundwater_cv_harmonic_rmse_m": gw_cv_harmonic_rmse,
         "lambda": lam,
         "observation_cells": int(len(obs)),
         "basis_nodes": int(len(nodes)),

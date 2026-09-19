@@ -1,4 +1,4 @@
-# hydrogeo-insar v0.3
+# hydrogeo-insar v0.3.1
 
 V0.3 keeps the verified `test-gw` input formats and replaces the scientific core with a continuous-field hydrogeodetic workflow. The code is designed for corrected cumulative vertical InSAR GeoTIFF time series and regional groundwater monitoring networks.
 
@@ -54,6 +54,29 @@ confined groundwater observations
 8. Ske data support, Ske solution support and groundwater support are separate products. Ske extrapolation is limited by a physical distance from seasonal observations.
 9. Annual TGWS/RGWS/IGWS use a continuous piecewise-linear low-frequency model plus annual harmonic, rather than differences from one full-period quadratic trend.
 10. Storage output distinguishes signed irreversible change, net irreversible-loss magnitude and gross negative irreversible change.
+
+
+## v0.3.1 science fixes
+
+- Groundwater temporal interpolation no longer bridges long periods rejected by the active-well support criterion.
+- Regional lag and Ske weighting now include the held-out groundwater harmonic-vector CV RMSE as an uncertainty floor.
+- Ske fitting reports and uses the lag-corrected seasonal vector cosine so non-coherent seasonal response is not forced into near-zero storativity.
+- Storage cumulative and annual outputs now obey the configured `baseline_date` to `end_date` interval exactly.
+- Added an independent visualization module for stage-by-stage result checks. Scientific calculations do not depend on plotting.
+
+Plot all available checks:
+
+```bash
+hydrogeo-insar plot configs/example_project.yaml --stage all
+```
+
+Plot one stage:
+
+```bash
+hydrogeo-insar plot configs/example_project.yaml --stage estimate-ske
+```
+
+Figures are written to `outputs/figures/checks/` by default.
 
 ## Core equations
 

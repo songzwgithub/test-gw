@@ -11,6 +11,7 @@ from rasterio.transform import from_origin
 from hydrogeo_insar.common import pixel_area_rows, read_tif
 from hydrogeo_insar.config import load_config
 from hydrogeo_insar.pipeline import run_pipeline
+from hydrogeo_insar.visualization import plot_stage
 
 
 def _make_case(root: Path):
@@ -111,9 +112,15 @@ def test_full_pipeline_recovers_lag_ske_and_irreversible_storage(tmp_path):
     area = pixel_area_rows(domain.shape[0], domain.shape[1], crs, transform)[:, None]
     truth = float(np.sum((true_mm[domain] / 1000.0) * np.broadcast_to(area, domain.shape)[domain]))
     estimate = float(storage["irreversible_gws_change_m3"])
-    assert abs(estimate - truth) <= 0.20 * max(1.0, abs(truth))
+    assert abs(estimate - truth) <= 0.05 * max(1.0, abs(truth))
     assert abs(storage["total_gws_change_m3"] - storage["recoverable_gws_change_m3"] - estimate) < 1e-8 * max(1.0, abs(storage["total_gws_change_m3"]))
 
     annual = pd.read_csv(cfg.outputs / "storage" / "storage_annual_change.csv")
     assert len(annual) >= 3
     assert np.isfinite(annual["irreversible_gws_change_m3"]).all()
+
+    ske_plot = plot_stage(cfg, "estimate-ske")
+    storage_plot = plot_stage(cfg, "storage-budget")
+    assert ske_plot["status"] == "ok"
+    assert storage_plot["status"] == "ok"
+    assert all(Path(x).exists() for x in ske_plot["files"] + storage_plot["files"])

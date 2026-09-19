@@ -50,10 +50,19 @@ def estimate_lag(cfg: ProjectConfig) -> dict[str, Any]:
     with rasterio.open(out_dir / "head_annual_sin_m.tif") as ref:
         write_tif(out_dir / "phase_lag_days.tif", phase_lag.astype("float32"), str(ref.crs), ref.transform)
 
+    gw_summary_path = cfg.outputs / "groundwater" / "groundwater_field_summary.json"
+    gw_cv_harmonic_rmse = 0.0
+    if gw_summary_path.exists():
+        import json
+        gw_summary = json.loads(gw_summary_path.read_text(encoding="utf-8"))
+        value = float(gw_summary.get("cv_harmonic_vector_rmse_m", 0.0))
+        if np.isfinite(value) and value > 0:
+            gw_cv_harmonic_rmse = value
+    head_sigma = np.sqrt(hrmse * hrmse + gw_cv_harmonic_rmse * gw_cv_harmonic_rmse)
     quality = 1.0 / (
         1.0
         + (drmse / np.maximum(damp, 1e-6)) ** 2
-        + (hrmse / np.maximum(hamp, 1e-6)) ** 2
+        + (head_sigma / np.maximum(hamp, 1e-6)) ** 2
     )
     weight = quality * damp * hamp
     weight[~valid] = np.nan
@@ -95,6 +104,7 @@ def estimate_lag(cfg: ProjectConfig) -> dict[str, Any]:
         "weighted_cosine_similarity": best_score,
         "pixel_phase_lag_median_days": float(np.nanmedian(phase_lag)),
         "valid_pixels": int(valid.sum()),
+        "groundwater_cv_harmonic_rmse_m": gw_cv_harmonic_rmse,
     }
     write_json(out_dir / "lag_summary.json", summary)
     return summary

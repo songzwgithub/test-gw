@@ -1,3 +1,12 @@
+# v0.3.1 changes
+
+- prevent long unsupported groundwater time gaps from being silently bridged by temporal interpolation;
+- make storage cumulative and annual reporting obey the configured baseline/end interval;
+- add groundwater spatial-CV harmonic error as an uncertainty floor in regional lag and Ske weighting;
+- add lag-corrected seasonal vector-coherence diagnostics to the Ske inversion;
+- add stage-by-stage visualization via `hydrogeo-insar plot`;
+- tighten the synthetic storage regression tolerance and add a long-gap temporal support test.
+
 # v0.3 changes
 
 - preserved the verified v0.2/test-gw data readers;
