@@ -1,16 +1,17 @@
-# v0.2 changes
+# v0.3 changes
 
-- kept v0.1 groundwater and GeoTIFF input formats;
-- enforced one common InSAR reference date and canonical uplift-positive sign;
-- prohibited groundwater temporal extrapolation;
-- added spatial block-CV for low-rank + RBF groundwater model selection;
-- unified temporal design/fitting code;
-- fitted seasonal deformation and groundwater on the same dates;
-- implemented Meng-2026 feature set for deformation regimes;
-- implemented phase-lag raster + regional lag scan;
-- replaced raw `Ske` ratio as the final product with bounded coarse-grid Laplacian inversion;
-- separated `Ske` observation support from storage analysis support;
-- retained signed irreversible groundwater-storage change;
-- added model-based annual storage increments;
-- fixed partial-layer totals in hydrostratigraphy;
-- fixed extensometer ordering and cumulative-marker conversion.
+- preserved the verified v0.2/test-gw data readers;
+- added minimum active-well temporal support for groundwater field construction;
+- expanded groundwater spatial block-CV to annual amplitude, phase, harmonic-vector and trend diagnostics;
+- changed groundwater model selection to full-series-RMSE shortlist + harmonic-vector criterion;
+- added continuous piecewise-linear time functions;
+- fixed the near-zero-curvature deformation vertex feature;
+- changed K-means training to spatially balanced sampling with chunked full-raster prediction;
+- separated lag estimation into its own module and added fit-quality weighting;
+- replaced pixel-stride/coarse-cell Ske with a continuous physical-km normalized-RBF basis inversion;
+- separated seasonal-data support from Ske solution support;
+- limited Ske solution support by physical distance from seasonal observations;
+- selected Ske node spacing and regularization by spatial block-CV;
+- replaced quadratic-derived annual storage changes with piecewise-linear + annual low-frequency changes;
+- retained signed IGWS and added separate net/gross loss diagnostics;
+- synthesis now uses low-frequency groundwater recovery rather than the quadratic model's linear coefficient.

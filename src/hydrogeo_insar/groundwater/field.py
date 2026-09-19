@@ -6,7 +6,6 @@ from typing import Any
 import h5py
 import numpy as np
 import pandas as pd
-import rasterio
 from pyproj import Transformer
 from rasterio.transform import xy as raster_xy
 from scipy.spatial import Delaunay, cKDTree
@@ -14,6 +13,8 @@ from scipy.spatial.distance import cdist
 
 from ..common import affine_to_list, block_slices, days_to_dates, ensure_dir, h5_grid_metadata, write_json, write_tif
 from ..config import ProjectConfig
+from ..temporal.fit import fit_series
+from ..temporal.model import TimeModel, coefficient_indices, design_matrix
 
 
 @dataclass
@@ -35,8 +36,7 @@ class LowRankRBFModel:
 
 def _auto_utm_epsg(lon: float, lat: float) -> str:
     zone = int((lon + 180.0) // 6.0) + 1
-    epsg = 32600 + zone if lat >= 0 else 32700 + zone
-    return f"EPSG:{epsg}"
+    return f"EPSG:{32600 + zone if lat >= 0 else 32700 + zone}"
 
 
 def _farthest_centers(points: np.ndarray, n: int) -> np.ndarray:
@@ -72,14 +72,13 @@ def _iterative_svd_impute(matrix: np.ndarray, rank: int, n_iter: int = 20, tol: 
     if not obs.any():
         raise ValueError("Groundwater matrix contains no finite observations")
     filled = matrix.copy()
-    # Missing values begin at each well's anomaly mean (= approximately zero).
     row_mean = np.nanmean(matrix, axis=1)
     row_mean = np.where(np.isfinite(row_mean), row_mean, 0.0)
     filled[~obs] = np.repeat(row_mean[:, None], matrix.shape[1], axis=1)[~obs]
     prev_missing = filled[~obs].copy()
     for _ in range(int(n_iter)):
         u, s, vt = np.linalg.svd(filled, full_matrices=False)
-        r = min(int(rank), len(s), matrix.shape[0] - 1)
+        r = min(int(rank), len(s), max(1, matrix.shape[0] - 1))
         recon = (u[:, :r] * s[:r]) @ vt[:r]
         filled[~obs] = recon[~obs]
         current = filled[~obs]
@@ -89,7 +88,7 @@ def _iterative_svd_impute(matrix: np.ndarray, rank: int, n_iter: int = 20, tol: 
             if diff < tol:
                 break
     u, s, vt = np.linalg.svd(filled, full_matrices=False)
-    r = min(int(rank), len(s), matrix.shape[0] - 1)
+    r = min(int(rank), len(s), max(1, matrix.shape[0] - 1))
     scores = u[:, :r] * s[:r]
     components = vt[:r]
     return filled, scores, components
@@ -103,7 +102,6 @@ def _prepare_well_matrix(cfg: ProjectConfig):
     if gw.empty:
         raise ValueError(f"No groundwater observations for aquifer_class={aquifer!r}")
 
-    # A station must have one stable coordinate. This is a data-integrity check, not an inference step.
     coord_tol = float(sec.get("coordinate_tolerance_deg", 1e-5))
     for sid, g in gw.groupby("station_id"):
         if (g["lon"].max() - g["lon"].min() > coord_tol) or (g["lat"].max() - g["lat"].min() > coord_tol):
@@ -112,7 +110,6 @@ def _prepare_well_matrix(cfg: ProjectConfig):
     analysis = cfg.section("analysis")
     requested_start = pd.Timestamp(analysis.get("start_date", gw["date"].min()))
     requested_end = pd.Timestamp(analysis.get("end_date", gw["date"].max()))
-    # Never extrapolate beyond actual temporal support of the groundwater observations.
     start = max(requested_start, pd.Timestamp(gw["date"].min()))
     end = min(requested_end, pd.Timestamp(gw["date"].max()))
     if end <= start:
@@ -126,27 +123,31 @@ def _prepare_well_matrix(cfg: ProjectConfig):
     min_baseline_obs = int(sec.get("min_baseline_observations", 6))
 
     meta = gw.groupby("station_id", as_index=False).agg(lon=("lon", "first"), lat=("lat", "first"))
-    rows = []
-    ids = []
+    rows, ids = [], []
     for sid, group in gw.groupby("station_id"):
         s = group.groupby("date")["head_m"].median().reindex(dates)
         s = _interpolate_short_gaps(s, max_gap)
         bsel = s.loc[(s.index >= bstart) & (s.index <= bend)]
         if int(bsel.notna().sum()) < min_baseline_obs:
             continue
-        baseline = float(bsel.median())
-        rows.append((s - baseline).to_numpy(float))
+        rows.append((s - float(bsel.median())).to_numpy(float))
         ids.append(str(sid))
 
     if len(rows) < 4:
         raise ValueError("At least four groundwater wells with valid baselines are required")
     matrix = np.vstack(rows)
-    min_coverage = float(sec.get("min_coverage_fraction", 0.5))
-    keep = np.isfinite(matrix).mean(axis=1) >= min_coverage
+    keep = np.isfinite(matrix).mean(axis=1) >= float(sec.get("min_coverage_fraction", 0.5))
     matrix = matrix[keep]
     ids = [sid for sid, k in zip(ids, keep) if k]
     if len(ids) < 4:
         raise ValueError("Too few groundwater wells after coverage filtering")
+
+    min_active = float(sec.get("min_active_well_fraction", 0.0))
+    if min_active > 0:
+        keep_t = np.isfinite(matrix).mean(axis=0) >= min_active
+        dates = dates[keep_t]
+        matrix = matrix[:, keep_t]
+
     meta["station_id"] = meta["station_id"].astype(str)
     meta = meta.set_index("station_id").loc[ids].reset_index()
     return dates, matrix, meta, str(bstart.date()), str(bend.date())
@@ -189,9 +190,7 @@ def _spatial_fold_ids(xy: np.ndarray, n_folds: int, block_km: float, random_stat
 
 
 def _candidate_values(sec: dict[str, Any], xy: np.ndarray):
-    ranks = sec.get("rank_candidates")
-    if ranks is None:
-        ranks = [int(sec.get("rank", 4))]
+    ranks = sec.get("rank_candidates") or [int(sec.get("rank", 4))]
     rbf = sec.get("rbf", {})
     sigmas = rbf.get("sigma_km_candidates")
     if sigmas is None:
@@ -200,10 +199,49 @@ def _candidate_values(sec: dict[str, Any], xy: np.ndarray):
         else:
             d = cdist(xy, xy)
             vals = d[d > 0]
-            auto = float(np.median(vals) / 1000.0) if vals.size else 20.0
-            sigmas = [auto]
+            sigmas = [float(np.median(vals) / 1000.0) if vals.size else 20.0]
     ridges = rbf.get("ridge_candidates") or [float(rbf.get("ridge", 1e-3))]
     return [int(r) for r in ranks], [float(s) for s in sigmas], [float(r) for r in ridges]
+
+
+def _harmonic_signature(dates: np.ndarray, values: np.ndarray, period_days: float, degree: int):
+    model = TimeModel(polynomial_degree=degree, periods_days=(period_days,))
+    X, _ = design_matrix(dates, model)
+    beta, _rmse, _n, _rss = fit_series(values, X, min_obs=max(24, model.n_parameters + 2))
+    if not np.isfinite(beta).all():
+        return None
+    p = coefficient_indices(model)["periodic"][0]
+    s = float(beta[p["sin"]]); c = float(beta[p["cos"]])
+    amp = float(np.hypot(s, c))
+    phase = float((np.arctan2(s, c) * period_days / (2.0 * np.pi)) % period_days)
+    linear = float(beta[1]) if degree >= 1 else 0.0
+    return s, c, amp, phase, linear
+
+
+def _cv_temporal_metrics(dates: pd.DatetimeIndex, actual: np.ndarray, predicted: np.ndarray, period_days: float, degree: int):
+    amp_err, phase_err, vec_err, trend_err = [], [], [], []
+    np_dates = dates.to_numpy(dtype="datetime64[D]")
+    for i in range(actual.shape[0]):
+        ok = np.isfinite(actual[i]) & np.isfinite(predicted[i])
+        if ok.sum() < max(24, degree + 5):
+            continue
+        a = _harmonic_signature(np_dates[ok], actual[i, ok], period_days, degree)
+        p = _harmonic_signature(np_dates[ok], predicted[i, ok], period_days, degree)
+        if a is None or p is None:
+            continue
+        amp_err.append(p[2] - a[2])
+        pdiff = abs(p[3] - a[3]) % period_days
+        phase_err.append(min(pdiff, period_days - pdiff))
+        vec_err.append(np.hypot(p[0] - a[0], p[1] - a[1]))
+        trend_err.append(p[4] - a[4])
+    if not amp_err:
+        return np.nan, np.nan, np.nan, np.nan
+    return (
+        float(np.sqrt(np.mean(np.square(amp_err)))),
+        float(np.mean(phase_err)),
+        float(np.sqrt(np.mean(np.square(vec_err)))),
+        float(np.sqrt(np.mean(np.square(trend_err)))),
+    )
 
 
 def select_groundwater_model(cfg: ProjectConfig, dates, matrix, meta, xy):
@@ -211,15 +249,22 @@ def select_groundwater_model(cfg: ProjectConfig, dates, matrix, meta, xy):
     ranks, sigmas_km, ridges = _candidate_values(sec, xy)
     cv = sec.get("cross_validation", {})
     n_folds = min(int(cv.get("folds", 5)), len(meta))
-    block_km = float(cv.get("block_km", 30.0))
-    fold_id = _spatial_fold_ids(xy, n_folds=n_folds, block_km=block_km, random_state=int(cv.get("random_state", 20260919)))
+    fold_id = _spatial_fold_ids(
+        xy,
+        n_folds=n_folds,
+        block_km=float(cv.get("block_km", 30.0)),
+        random_state=int(cv.get("random_state", 20260919)),
+    )
     max_centers = int(sec.get("rbf", {}).get("max_centers", 32))
+    period_days = float(cv.get("annual_period_days", 365.2425))
+    harmonic_degree = int(cv.get("harmonic_polynomial_degree", 1))
     rows = []
 
     for rank in ranks:
         for sigma_km in sigmas_km:
             for ridge in ridges:
-                errors = []
+                sqerr = []
+                amp_metrics, phase_metrics, vector_metrics, trend_metrics = [], [], [], []
                 n_test = 0
                 for fold in range(n_folds):
                     train = fold_id != fold
@@ -237,14 +282,40 @@ def select_groundwater_model(cfg: ProjectConfig, dates, matrix, meta, xy):
                     actual = matrix[test]
                     ok = np.isfinite(actual) & np.isfinite(pred)
                     if ok.any():
-                        errors.append((actual[ok] - pred[ok]) ** 2)
+                        sqerr.append((actual[ok] - pred[ok]) ** 2)
                         n_test += int(ok.sum())
-                rmse = float(np.sqrt(np.mean(np.concatenate(errors)))) if errors else np.inf
-                rows.append({"rank": rank, "sigma_km": sigma_km, "ridge": ridge, "cv_rmse_m": rmse, "n_test_values": n_test})
+                    am, ph, hv, tr = _cv_temporal_metrics(dates, actual, pred, period_days, harmonic_degree)
+                    if np.isfinite(am): amp_metrics.append(am)
+                    if np.isfinite(ph): phase_metrics.append(ph)
+                    if np.isfinite(hv): vector_metrics.append(hv)
+                    if np.isfinite(tr): trend_metrics.append(tr)
 
-    table = pd.DataFrame(rows).sort_values(["cv_rmse_m", "rank", "sigma_km", "ridge"]).reset_index(drop=True)
-    if table.empty or not np.isfinite(table.loc[0, "cv_rmse_m"]):
+                rows.append({
+                    "rank": rank,
+                    "sigma_km": sigma_km,
+                    "ridge": ridge,
+                    "cv_rmse_m": float(np.sqrt(np.mean(np.concatenate(sqerr)))) if sqerr else np.inf,
+                    "cv_annual_amplitude_rmse_m": float(np.sqrt(np.mean(np.square(amp_metrics)))) if amp_metrics else np.nan,
+                    "cv_phase_mae_days": float(np.mean(phase_metrics)) if phase_metrics else np.nan,
+                    "cv_harmonic_vector_rmse_m": float(np.sqrt(np.mean(np.square(vector_metrics)))) if vector_metrics else np.nan,
+                    "cv_linear_trend_rmse_m_yr": float(np.sqrt(np.mean(np.square(trend_metrics)))) if trend_metrics else np.nan,
+                    "n_test_values": n_test,
+                })
+
+    table = pd.DataFrame(rows)
+    finite = table[np.isfinite(table["cv_rmse_m"])].copy()
+    if finite.empty:
         raise ValueError("Groundwater spatial cross-validation produced no valid candidate")
+    rmse_min = float(finite["cv_rmse_m"].min())
+    shortlist = finite[finite["cv_rmse_m"] <= rmse_min * (1.0 + float(cv.get("rmse_shortlist_fraction", 0.05)))].copy()
+    if shortlist["cv_harmonic_vector_rmse_m"].notna().any():
+        shortlist = shortlist.sort_values(["cv_harmonic_vector_rmse_m", "cv_rmse_m", "rank", "sigma_km", "ridge"])
+    else:
+        shortlist = shortlist.sort_values(["cv_rmse_m", "rank", "sigma_km", "ridge"])
+    best_idx = shortlist.index[0]
+    table["selected"] = False
+    table.loc[best_idx, "selected"] = True
+    table = table.sort_values(["selected", "cv_rmse_m"], ascending=[False, True]).reset_index(drop=True)
     best = table.iloc[0]
     return int(best["rank"]), float(best["sigma_km"]), float(best["ridge"]), table
 
@@ -253,8 +324,7 @@ def _support_mask_points(points_xy: np.ndarray, query_xy: np.ndarray, max_distan
     if len(points_xy) < 3:
         inside = np.ones(len(query_xy), dtype=bool)
     else:
-        hull = Delaunay(points_xy)
-        inside = hull.find_simplex(query_xy) >= 0
+        inside = Delaunay(points_xy).find_simplex(query_xy) >= 0
     if max_distance_m is not None:
         dist, _ = cKDTree(points_xy).query(query_xy, k=1)
         inside &= dist <= float(max_distance_m)
@@ -332,6 +402,7 @@ def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
         h5.attrs["rank"] = rank
         h5.attrs["sigma_km"] = sigma_km
         h5.attrs["ridge"] = ridge
+        h5.attrs["projected_crs"] = projected_crs
 
         for r0, r1, c0, c1 in block_slices(height, width, block_size):
             rr, cc = np.meshgrid(np.arange(r0, r1), np.arange(c0, c1), indexing="ij")
@@ -349,18 +420,10 @@ def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
     write_tif(out_dir / "groundwater_support_mask.tif", support_full, grid["crs"], grid["transform"], nodata=0, dtype="uint8")
     np.savez_compressed(
         out_dir / "groundwater_model.npz",
-        station_ids=np.asarray(model.station_ids),
-        station_lonlat=model.station_lonlat,
-        station_xy=model.station_xy,
-        rank=model.rank,
-        temporal_dates=model.temporal_dates.astype(str),
-        temporal_components=model.temporal_components,
-        score_coefficients=model.score_coefficients,
-        centers_xy=model.centers_xy,
-        sigma_m=model.sigma_m,
-        ridge=model.ridge,
-        projected_crs=model.projected_crs,
-        baseline_start=model.baseline_start,
+        station_ids=np.asarray(model.station_ids), station_lonlat=model.station_lonlat, station_xy=model.station_xy,
+        rank=model.rank, temporal_dates=model.temporal_dates.astype(str), temporal_components=model.temporal_components,
+        score_coefficients=model.score_coefficients, centers_xy=model.centers_xy, sigma_m=model.sigma_m,
+        ridge=model.ridge, projected_crs=model.projected_crs, baseline_start=model.baseline_start,
         baseline_end=model.baseline_end,
     )
     score_table = meta.copy()
@@ -368,6 +431,7 @@ def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
         score_table[f"score_{k+1}"] = scores[:, k]
     score_table.to_csv(out_dir / "groundwater_spatial_scores.csv", index=False)
 
+    best = cv_table.iloc[0]
     summary = {
         "status": "ok",
         "output": str(out_path),
@@ -382,7 +446,10 @@ def build_groundwater_field(cfg: ProjectConfig) -> dict[str, Any]:
         "last_supported_date": str(obs_dates[-1]),
         "epochs": len(obs_dates),
         "support_pixels": int(support_full.sum()),
-        "cv_rmse_m": float(cv_table.iloc[0]["cv_rmse_m"]),
+        "cv_rmse_m": float(best["cv_rmse_m"]),
+        "cv_annual_amplitude_rmse_m": float(best["cv_annual_amplitude_rmse_m"]),
+        "cv_phase_mae_days": float(best["cv_phase_mae_days"]),
+        "cv_harmonic_vector_rmse_m": float(best["cv_harmonic_vector_rmse_m"]),
     }
     write_json(out_dir / "groundwater_field_summary.json", summary)
     return summary

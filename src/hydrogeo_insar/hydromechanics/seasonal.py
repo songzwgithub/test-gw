@@ -6,13 +6,12 @@ from typing import Any
 import h5py
 import numpy as np
 import pandas as pd
-import rasterio
 
-from ..common import block_slices, days_to_dates, ensure_dir, h5_grid_metadata, read_tif, write_json, write_tif
+from ..common import block_slices, days_to_dates, ensure_dir, h5_grid_metadata, write_json, write_tif
 from ..config import ProjectConfig
 from ..temporal.fit import fit_block
 from ..temporal.model import TimeModel, coefficient_indices, design_matrix
-from ..temporal.select import choose_global_polynomial_degree
+from ..temporal.select import choose_global_polynomial_degree, choose_linear_or_quadratic_f_test
 
 
 def rotate_coefficients(sin_coef: np.ndarray, cos_coef: np.ndarray, lag_days: float, period_days: float):
@@ -27,11 +26,13 @@ def _common_dates(insar_dates: np.ndarray, head_dates: np.ndarray):
     return common, i_idx, h_idx
 
 
-def _sample_head_series(field_path: Path, h_idx: np.ndarray, max_series: int, block_size: int):
+def _sample_head_series(field_path: Path, h_idx: np.ndarray, max_series: int, block_size: int, random_state: int = 20260919):
     grid = h5_grid_metadata(field_path)
+    blocks = list(block_slices(grid["height"], grid["width"], block_size))
+    np.random.default_rng(random_state).shuffle(blocks)
     collected = []
     with h5py.File(field_path, "r") as h5:
-        for r0, r1, c0, c1 in block_slices(grid["height"], grid["width"], block_size):
+        for r0, r1, c0, c1 in blocks:
             arr = h5["head_anomaly_m"][h_idx, r0:r1, c0:c1].astype(float)
             T = arr.shape[0]
             flat = arr.reshape(T, -1)
@@ -39,7 +40,8 @@ def _sample_head_series(field_path: Path, h_idx: np.ndarray, max_series: int, bl
             if good.any():
                 take = flat[:, good]
                 if take.shape[1] > 200:
-                    take = take[:, :: max(1, take.shape[1] // 200)]
+                    ii = np.linspace(0, take.shape[1] - 1, 200).astype(int)
+                    take = take[:, ii]
                 collected.append(take)
             if sum(x.shape[1] for x in collected) >= max_series:
                 break
@@ -71,11 +73,18 @@ def compute_joint_harmonics(cfg: ProjectConfig) -> dict[str, Any]:
     g_degree_cfg = sec.get("groundwater_polynomial_degree", "auto")
     model_selection_rows = []
     if str(g_degree_cfg).lower() == "auto":
-        sample = _sample_head_series(head_path, h_idx, int(sec.get("model_selection_sample_size", 3000)), block_size)
+        sample = _sample_head_series(head_path, h_idx, int(sec.get("model_selection_sample_size", 3000)), block_size, int(sec.get("random_state", 20260919)))
         candidates = [int(v) for v in sec.get("groundwater_polynomial_candidates", [1, 2])]
-        g_degree, model_selection_rows = choose_global_polynomial_degree(
-            dates, sample, candidates=candidates, periods_days=(period,), min_obs=min_obs
-        )
+        selection_method = str(sec.get("groundwater_model_selection", "aicc")).lower()
+        if selection_method == "f_test" and set(candidates) >= {1, 2}:
+            g_degree, model_selection_rows = choose_linear_or_quadratic_f_test(
+                dates, sample, periods_days=(period,), min_obs=min_obs,
+                alpha=float(sec.get("groundwater_f_test_alpha", 0.05)),
+            )
+        else:
+            g_degree, model_selection_rows = choose_global_polynomial_degree(
+                dates, sample, candidates=candidates, periods_days=(period,), min_obs=min_obs
+            )
     else:
         g_degree = int(g_degree_cfg)
 
@@ -93,12 +102,14 @@ def compute_joint_harmonics(cfg: ProjectConfig) -> dict[str, Any]:
         "deformation_annual_cos_mm": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "deformation_annual_amplitude_mm": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "deformation_annual_phase_day": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
+        "deformation_fit_rmse_mm": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "head_intercept_m": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "head_linear_m_yr": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "head_annual_sin_m": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "head_annual_cos_m": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "head_annual_amplitude_m": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
         "head_annual_phase_day": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
+        "head_fit_rmse_m": np.full((grid["height"], grid["width"]), np.nan, dtype="float32"),
     }
     if g_degree >= 2:
         products["head_quadratic_m_yr2"] = np.full((grid["height"], grid["width"]), np.nan, dtype="float32")
@@ -108,8 +119,8 @@ def compute_joint_harmonics(cfg: ProjectConfig) -> dict[str, Any]:
             darr = ih5["displacement_mm"][i_idx, r0:r1, c0:c1].astype(float)
             harr = hh5["head_anomaly_m"][h_idx, r0:r1, c0:c1].astype(float)
             T, bh, bw = darr.shape
-            dbeta, _drmse, _dn, _ = fit_block(darr.reshape(T, -1), Xd, min_obs=min_obs)
-            hbeta, _hrmse, _hn, _ = fit_block(harr.reshape(T, -1), Xg, min_obs=min_obs)
+            dbeta, drmse, _dn, _ = fit_block(darr.reshape(T, -1), Xd, min_obs=min_obs)
+            hbeta, hrmse, _hn, _ = fit_block(harr.reshape(T, -1), Xg, min_obs=min_obs)
             ds, dc = dbeta[:, dp["sin"]], dbeta[:, dp["cos"]]
             hs, hc = hbeta[:, gp["sin"]], hbeta[:, gp["cos"]]
             vals = {
@@ -117,12 +128,14 @@ def compute_joint_harmonics(cfg: ProjectConfig) -> dict[str, Any]:
                 "deformation_annual_cos_mm": dc,
                 "deformation_annual_amplitude_mm": np.hypot(ds, dc),
                 "deformation_annual_phase_day": (np.arctan2(ds, dc) * period / (2*np.pi)) % period,
+                "deformation_fit_rmse_mm": drmse,
                 "head_intercept_m": hbeta[:, 0],
                 "head_linear_m_yr": hbeta[:, 1],
                 "head_annual_sin_m": hs,
                 "head_annual_cos_m": hc,
                 "head_annual_amplitude_m": np.hypot(hs, hc),
                 "head_annual_phase_day": (np.arctan2(hs, hc) * period / (2*np.pi)) % period,
+                "head_fit_rmse_m": hrmse,
             }
             if g_degree >= 2:
                 vals["head_quadratic_m_yr2"] = hbeta[:, 2]
@@ -145,63 +158,3 @@ def compute_joint_harmonics(cfg: ProjectConfig) -> dict[str, Any]:
     }
     write_json(out_dir / "joint_harmonics_summary.json", result)
     return result
-
-
-def estimate_lag(cfg: ProjectConfig) -> dict[str, Any]:
-    sec = cfg.section("seasonal_response")
-    period = float(sec.get("annual_period_days", 365.2425))
-    search = sec.get("lag_search_days", [0.0, 180.0])
-    step = float(sec.get("lag_step_days", 0.5))
-    lags = np.arange(float(search[0]), float(search[1]) + step*0.5, step)
-    out_dir = ensure_dir(cfg.outputs / "seasonal")
-
-    ds = read_tif(out_dir / "deformation_annual_sin_mm.tif") / 1000.0
-    dc = read_tif(out_dir / "deformation_annual_cos_mm.tif") / 1000.0
-    hs = read_tif(out_dir / "head_annual_sin_m.tif")
-    hc = read_tif(out_dir / "head_annual_cos_m.tif")
-    damp_mm = np.hypot(ds, dc) * 1000.0
-    hamp_m = np.hypot(hs, hc)
-    valid = np.isfinite(ds) & np.isfinite(dc) & np.isfinite(hs) & np.isfinite(hc)
-    valid &= hamp_m >= float(sec.get("min_head_amplitude_m", 0.2))
-    valid &= damp_mm >= float(sec.get("min_deformation_amplitude_mm", 0.5))
-    support_path = cfg.outputs / "groundwater" / "groundwater_support_mask.tif"
-    if support_path.exists():
-        valid &= read_tif(support_path) > 0
-    if valid.sum() < 10:
-        raise ValueError("Too few pixels for seasonal lag estimation")
-
-    phase_d = (np.arctan2(ds, dc) * period / (2*np.pi)) % period
-    phase_h = (np.arctan2(hs, hc) * period / (2*np.pi)) % period
-    phase_lag = (phase_d - phase_h) % period
-    phase_lag[~valid] = np.nan
-    with rasterio.open(out_dir / "head_annual_sin_m.tif") as ref:
-        write_tif(out_dir / "phase_lag_days.tif", phase_lag.astype("float32"), str(ref.crs), ref.transform)
-
-    idx = np.flatnonzero(valid)
-    max_samples = int(sec.get("lag_sample_size", 200000))
-    if len(idx) > max_samples:
-        rng = np.random.default_rng(int(sec.get("random_state", 20260919)))
-        idx = rng.choice(idx, max_samples, replace=False)
-    dsv, dcv = ds.ravel()[idx], dc.ravel()[idx]
-    hsv, hcv = hs.ravel()[idx], hc.ravel()[idx]
-    dnorm = np.maximum(np.hypot(dsv, dcv), 1e-12)
-    rows = []
-    best_lag, best_score = None, -np.inf
-    for lag in lags:
-        rs, rc = rotate_coefficients(hsv, hcv, lag, period)
-        hnorm = np.maximum(np.hypot(rs, rc), 1e-12)
-        cosine = (dsv*rs + dcv*rc) / (dnorm*hnorm)
-        score = float(np.nanmedian(cosine))
-        rows.append((lag, score))
-        if score > best_score:
-            best_lag, best_score = float(lag), score
-    np.savetxt(out_dir / "lag_scan.csv", np.asarray(rows), delimiter=",", header="lag_days,median_cosine_similarity", comments="")
-    summary = {
-        "status": "ok",
-        "lag_days": best_lag,
-        "median_cosine_similarity": best_score,
-        "pixel_phase_lag_median_days": float(np.nanmedian(phase_lag)),
-        "valid_pixels": int(valid.sum()),
-    }
-    write_json(out_dir / "lag_summary.json", summary)
-    return summary

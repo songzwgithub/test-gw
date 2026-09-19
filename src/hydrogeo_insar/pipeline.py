@@ -8,7 +8,8 @@ from .deformation.decompose import decompose_insar
 from .deformation.regimes import classify_deformation
 from .extensometer.analysis import analyze_extensometer
 from .groundwater.field import build_groundwater_field
-from .hydromechanics.seasonal import compute_joint_harmonics, estimate_lag
+from .hydromechanics.seasonal import compute_joint_harmonics
+from .hydromechanics.lag import estimate_lag
 from .hydromechanics.storativity import estimate_regularized_ske
 from .hydrostratigraphy.analysis import analyze_hydrostratigraphy
 from .io.groundwater import prepare_groundwater

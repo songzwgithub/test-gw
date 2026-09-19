@@ -1,35 +1,48 @@
-# v0.2 validation
+# v0.3 validation
 
-Validation was executed on a reproducible synthetic end-to-end case included in:
+Validation uses the reproducible end-to-end synthetic case in:
 
 ```text
 tests/integration/test_full_pipeline.py
 ```
 
-Synthetic truth:
+Synthetic truth includes:
 
-- common-reference cumulative vertical InSAR GeoTIFF series;
+- common-reference cumulative vertical InSAR GeoTIFFs;
 - daily confined-head observations at 12 wells;
-- annual groundwater forcing;
+- spatially varying annual groundwater forcing;
 - deformation response lag = **50 days**;
-- effective elastic skeletal storativity = **0.002**;
-- two spatially different long-term deformation regimes.
+- spatially constant effective elastic skeletal storativity = **0.002**;
+- two different long-term deformation regimes;
+- known piecewise-linear irreversible deformation, allowing analytical IGWS truth.
 
-Recovered by the complete pipeline through storage-budget:
+Latest local run recovered:
 
-- regional lag = **50.0 days**;
-- median regularized Ske = **0.00199963**;
-- groundwater spatial-CV RMSE = **0.0839 m** for the synthetic setup;
-- storage identity satisfied numerically: `V_total = V_recoverable + V_irreversible`.
+```text
+regional lag                         50.0 days
+median Ske                           0.00199583
+groundwater spatial-CV RMSE          0.08391 m
+groundwater annual amplitude RMSE    0.08716 m
+groundwater phase MAE                0.11277 days
+Ske CV deformation RMSE              8.00e-05 m
+```
+
+For the final synthetic storage interval:
+
+```text
+estimated irreversible GWS change  -1.57937e7 m3
+analytical truth                    -1.57992e7 m3
+relative error                       0.035 %
+```
 
 Automated tests:
 
 ```text
-4 passed
+5 passed
 ```
 
 Run with:
 
 ```bash
-PYTHONPATH=src python -m pytest -q
+PYTHONPATH=src pytest -q
 ```

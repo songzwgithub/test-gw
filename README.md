@@ -1,18 +1,16 @@
-# hydrogeo-insar v0.2
+# hydrogeo-insar v0.3
 
-V0.2 is the first scientifically reworked version of the generic InSAR-groundwater workflow discussed for the Hengshui paper. It keeps the proven v0.1/test-gw input contracts and rebuilds the scientific core.
+V0.3 keeps the verified `test-gw` input formats and replaces the scientific core with a continuous-field hydrogeodetic workflow. The code is designed for corrected cumulative vertical InSAR GeoTIFF time series and regional groundwater monitoring networks.
 
 ## Input contract
 
 ### InSAR
 
-Only corrected **cumulative vertical deformation** GeoTIFFs are accepted:
-
 ```text
 geo_YYYYMMDD_YYYYMMDD.tif
 ```
 
-All files must share the same first date. The second date is the observation date. The software does **not** re-reference the InSAR time series. It only converts units/sign into the canonical convention:
+All files are cumulative deformation relative to one common first date. The software does not re-reference the time series. Internally:
 
 ```text
 positive = uplift
@@ -22,42 +20,68 @@ unit     = mm
 
 ### Groundwater
 
-Groundwater reading intentionally follows v0.1/test-gw: CSV/Excel, wide/long layouts, explicit aquifer labels. Well depth is never used to infer aquifer groups.
+Groundwater readers remain compatible with the verified v0.2/test-gw CSV/Excel wide/long formats. Aquifer classes are explicit; well depth is not used to infer aquifer group.
 
-## Scientific changes from v0.1
+## Scientific workflow
 
-1. groundwater model selection by spatial block cross-validation;
-2. no temporal extrapolation outside observed groundwater support;
-3. one shared temporal-function engine for InSAR and groundwater;
-4. seasonal InSAR and groundwater harmonics are fitted on identical common epochs;
-5. groundwater trend degree can be selected globally by AICc (linear vs quadratic);
-6. Meng-2026-style deformation clustering uses `a, b, t_vertex, terminal_slope`;
-7. annual lag is output both as a pixel phase-lag field and a regional effective lag;
-8. `Ske` is a bounded spatially regularized inversion, not a raw pixel amplitude ratio;
-9. storage analysis uses its own fixed domain and preserves signed irreversible GWS change;
-10. true annual storage increments are separated from cumulative storage states;
-11. hydrostratigraphic totals require all configured layers to be valid;
-12. extensometer input explicitly distinguishes interval compaction and cumulative-marker displacement.
+```text
+corrected cumulative InSAR
+        +
+confined groundwater observations
+        |
+        +--> low-rank temporal model + Gaussian RBF spatial field
+        |
+        +--> quadratic + annual deformation model --> Meng-style regimes
+        |
+        +--> common-epoch annual harmonics --> regional lag
+        |
+        +--> continuous bounded Ske field on physical-km basis nodes
+        |
+        +--> piecewise-linear low-frequency deformation/head
+        |
+        +--> TGWS / RGWS / IGWS (Jiang-style partition)
+```
+
+## Main v0.3 changes
+
+1. Groundwater spatial model selection uses spatial block-CV and reports full-series RMSE, annual-amplitude RMSE, phase MAE and harmonic-vector RMSE.
+2. Groundwater model selection first keeps models within 5% of the minimum full-series RMSE, then selects the best annual harmonic reconstruction.
+3. Time functions support continuous piecewise-linear hinges in addition to polynomial and periodic terms.
+4. Deformation clustering keeps the Meng-style feature set but trains on a spatially balanced sample and predicts the full raster in chunks.
+5. The near-zero-curvature `t_vertex` feature bug is fixed.
+6. Pixel phase lag remains a diagnostic map; one quality-weighted regional lag is used in the Ske inversion.
+7. `Ske` is no longer estimated on pixel-count coarse cells. It is represented as a continuous normalized-RBF basis field with node spacing in kilometres, bounded coefficients and graph smoothing.
+8. Ske data support, Ske solution support and groundwater support are separate products. Ske extrapolation is limited by a physical distance from seasonal observations.
+9. Annual TGWS/RGWS/IGWS use a continuous piecewise-linear low-frequency model plus annual harmonic, rather than differences from one full-period quadratic trend.
+10. Storage output distinguishes signed irreversible change, net irreversible-loss magnitude and gross negative irreversible change.
 
 ## Core equations
 
-Annual response:
+Seasonal response:
 
 ```text
-d_A = Ske * R(tau) h_A
+d_A(x) = Ske(x) * R(tau_region) * h_A(x)
 ```
+
+Continuous Ske parameterization:
+
+```text
+Ske(x) = sum_j B_j(x) beta_j
+```
+
+where normalized RBF basis functions satisfy `B_j >= 0` and `sum_j B_j = 1`. The inversion minimizes harmonic deformation misfit plus graph smoothing with bounded `beta_j`.
 
 Jiang-style storage partition:
 
 ```text
-V_total = V_recoverable + V_irreversible
-V_recoverable = integral Ske * Delta h_confined dA
+V_total       = integral Delta d_lowfreq dA
+V_recoverable = integral Ske * Delta h_lowfreq dA
 V_irreversible = V_total - V_recoverable
 ```
 
-`V_irreversible` is signed. A negative value means irreversible storage depletion. `irreversible_storage_loss_magnitude_m3` is only a derived magnitude and is not used in the identity.
+`V_irreversible` remains signed. Negative values indicate irreversible storage depletion.
 
-## Install and run
+## Run
 
 ```bash
 pip install -e .
@@ -81,12 +105,34 @@ extensometer
 synthesize
 ```
 
-Run from one stage:
+Run to one stage:
 
 ```bash
-hydrogeo-insar run configs/example_project.yaml --from joint-harmonics
+hydrogeo-insar run configs/example_project.yaml --to estimate-ske
 ```
 
-## Current physical scope
+Continue from one stage:
 
-V0.2 implements the confined-system main model used for the Hengshui workflow. The optional unconfined geostatic-loading correction discussed in Li et al. (2025) is intentionally not enabled yet because v0.2 keeps the existing input/data path unchanged. It can be added later without changing the current file readers.
+```bash
+hydrogeo-insar run configs/example_project.yaml --from storage-budget
+```
+
+## Main outputs
+
+```text
+outputs/groundwater/groundwater_field.h5
+outputs/groundwater/groundwater_model_cv.csv
+outputs/regimes/deformation_regime_id.tif
+outputs/seasonal/phase_lag_days.tif
+outputs/seasonal/ske_effective.tif
+outputs/seasonal/ske_data_support_mask.tif
+outputs/seasonal/ske_support_mask.tif
+outputs/seasonal/ske_model_cv.csv
+outputs/storage/storage_annual_change.csv
+outputs/storage/total_gws_change_equivalent_mm.tif
+outputs/storage/recoverable_gws_change_equivalent_mm.tif
+outputs/storage/irreversible_gws_change_equivalent_mm.tif
+outputs/storage/head_lowfreq_change_m.tif
+```
+
+The code intentionally avoids release hashes, fixed expected scientific values and large audit/gate systems. Only checks needed to preserve data semantics and mathematical validity are retained.

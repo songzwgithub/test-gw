@@ -19,7 +19,7 @@ def synthesize(cfg: ProjectConfig) -> dict[str, Any]:
     ske = read_tif(cfg.outputs / "seasonal" / "ske_effective.tif")
     irr = read_tif(cfg.outputs / "storage" / "irreversible_gws_change_equivalent_mm.tif")
     rec = read_tif(cfg.outputs / "storage" / "recoverable_gws_change_equivalent_mm.tif")
-    htrend = read_tif(cfg.outputs / "seasonal" / "head_linear_m_yr.tif")
+    hchange = read_tif(cfg.outputs / "storage" / "head_lowfreq_change_m.tif")
     storage_domain = read_tif(cfg.outputs / "storage" / "storage_domain_mask.tif") > 0
 
     clay_total = None
@@ -41,7 +41,7 @@ def synthesize(cfg: ProjectConfig) -> dict[str, Any]:
             "regime": names.get(cid, f"cluster_{cid}"),
             "storage_domain_pixel_count": int(m.sum()),
             "end_rate_median_mm_yr": float(np.nanmedian(end_rate[m])) if m.any() else np.nan,
-            "head_linear_trend_median_m_yr": float(np.nanmedian(htrend[m])) if m.any() else np.nan,
+            "head_lowfreq_change_median_m": float(np.nanmedian(hchange[m])) if m.any() else np.nan,
             "ske_median": float(np.nanmedian(ske[m])) if m.any() else np.nan,
             "recoverable_gws_change_median_mm": float(np.nanmedian(rec[m])) if m.any() else np.nan,
             "irreversible_gws_change_median_mm": float(np.nanmedian(irr[m])) if m.any() else np.nan,

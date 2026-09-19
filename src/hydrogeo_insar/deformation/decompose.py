@@ -93,11 +93,22 @@ def decompose_insar(cfg: ProjectConfig) -> dict[str, Any]:
                     start_rate = b
                     end_rate = b + 2.0 * a * duration
                     rate_change = end_rate - start_rate
-                    raw_vertex = np.where(np.abs(a) > float(sec.get("vertex_min_abs_curvature", 1e-4)), -b / (2.0 * a), np.nan)
-                    # Preserve raw mathematical vertex and a finite feature for clustering.
+                    eps = 1e-12
+                    mathematical_vertex = np.where(np.abs(a) > eps, -b / (2.0 * a), np.nan)
+                    raw_vertex = np.where(
+                        np.abs(a) > float(sec.get("vertex_min_abs_curvature", 1e-4)),
+                        mathematical_vertex,
+                        np.nan,
+                    )
+                    # Clustering keeps the direction of far-away mathematical vertices.
                     low = -duration
                     high = 2.0 * duration
-                    vertex_feature = np.where(np.isfinite(raw_vertex), np.clip(raw_vertex, low, high), np.where(b >= 0, high, low))
+                    fallback = np.where(b < 0, high, low)
+                    vertex_feature = np.where(
+                        np.isfinite(mathematical_vertex),
+                        np.clip(mathematical_vertex, low, high),
+                        fallback,
+                    )
                 else:
                     a = None
                     start_rate = b
