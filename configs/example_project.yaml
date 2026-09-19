@@ -1,0 +1,109 @@
+project:
+  name: hengshui_example
+  root: ..
+
+outputs: outputs
+
+analysis:
+  start_date: 2018-01-01
+  end_date: 2025-12-31
+
+insar:
+  path: data/raw/insar
+  pattern: "geo_*.tif"
+  filename_regex: "geo_(\\d{8})_(\\d{8})\\.tif$"
+  unit: mm
+  quantity: vertical_displacement
+  positive: uplift
+  block_size: 256
+
+groundwater:
+  path: data/raw/groundwater.xlsx
+  format: wide
+  sheet_name: 0
+  variable: depth_to_water
+  fields:
+    station_id: well_id
+    lon: lon
+    lat: lat
+    aquifer_class: layer
+    well_depth_m: depth_m
+    elevation_m: 地面标高
+  aquifer_labels:
+    承压水: confined
+    潜水: unconfined
+  minimum_water_depth_m: -0.5
+
+groundwater_field:
+  aquifer: confined
+  rank: 4
+  max_gap_days: 7
+  svd_iterations: 12
+  projected_crs: null
+  grid_block_size: 256
+  baseline:
+    start: 2018-01-01
+    end: 2018-12-31
+  rbf:
+    max_centers: 32
+    sigma_km: null
+    ridge: 0.001
+
+deformation:
+  annual_period_days: 365.2425
+  min_observations: 24
+  block_size: 256
+
+regimes:
+  features:
+    - quadratic_coeff_mm_yr2
+    - start_rate_mm_yr
+    - end_rate_mm_yr
+    - rate_change_mm_yr
+    - vertex_time_year
+  k_candidates: [3, 4, 5]
+  random_state: 20260919
+  selection_sample_size: 50000
+  stable_rate_mm_yr: 5.0
+  deceleration_threshold_mm_yr: 5.0
+
+seasonal_response:
+  annual_period_days: 365.2425
+  min_observations: 24
+  min_head_amplitude_m: 0.2
+  min_deformation_amplitude_mm: 0.5
+  lag_search_days: [0, 180]
+  lag_step_days: 0.5
+  lag_sample_size: 200000
+  random_state: 20260919
+  block_size: 256
+
+ske:
+  min: 0.0
+  max: 0.05
+  support_sigma_pixels: 0.0
+
+storage:
+  baseline_date: 2018-01-01
+  end_date: null
+
+hydrostratigraphy:
+  enabled: false
+  layers:
+    - id: AQ1
+      sand: data/raw/geology/AQ1_sand_thickness.tif
+      clay: data/raw/geology/AQ1_clay_thickness.tif
+    - id: AQ2
+      sand: data/raw/geology/AQ2_sand_thickness.tif
+      clay: data/raw/geology/AQ2_clay_thickness.tif
+
+extensometer:
+  enabled: false
+  path: data/raw/extensometer.csv
+  lon: null
+  lat: null
+  fields:
+    date: date
+    depth_top_m: depth_top_m
+    depth_bottom_m: depth_bottom_m
+    compaction_mm: compaction_mm
