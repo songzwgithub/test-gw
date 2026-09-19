@@ -9,53 +9,16 @@ import rasterio
 
 from ..common import block_slices, days_to_dates, ensure_dir, h5_grid_metadata, write_json
 from ..config import ProjectConfig
+from ..temporal.fit import fit_block
+from ..temporal.model import TimeModel, coefficient_indices, design_matrix
 
 
-def design_matrix(dates: np.ndarray, period_days: float = 365.2425) -> tuple[np.ndarray, np.ndarray]:
-    dates = np.asarray(dates, dtype="datetime64[D]")
-    t_days = (dates - dates[0]).astype("timedelta64[D]").astype(float)
-    t_year = t_days / period_days
-    angle = 2.0 * np.pi * t_days / period_days
-    X = np.column_stack([
-        np.ones(len(dates)),
-        t_year,
-        t_year**2,
-        np.sin(angle),
-        np.cos(angle),
-    ])
-    return X, t_year
-
-
-def fit_block(y: np.ndarray, X: np.ndarray, min_obs: int = 24) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Fit c + b*t + a*t² + s*sin + c*cos for a T×P block."""
-    y = np.asarray(y, dtype=float)
-    valid = np.isfinite(y)
-    n = valid.sum(axis=0)
-    y0 = np.where(valid, y, 0.0)
-    w = valid.astype(float)
-    xtx = np.einsum("tp,ti,tj->pij", w, X, X, optimize=True)
-    xty = np.einsum("tp,ti,tp->pi", w, X, y0, optimize=True)
-    ridge = 1e-10 * np.eye(X.shape[1])[None, :, :]
-    beta = np.full((y.shape[1], X.shape[1]), np.nan, dtype=float)
-    good = n >= min_obs
-    if good.any():
-        beta[good] = np.linalg.solve(xtx[good] + ridge, xty[good][..., None])[..., 0]
-    pred = X @ np.nan_to_num(beta.T, nan=0.0)
-    residual = np.where(valid, y - pred, np.nan)
-    rmse = np.sqrt(np.nanmean(residual**2, axis=0))
-    rmse[~good] = np.nan
-    return beta, rmse, n
-
-
-def _writers(out_dir: Path, grid: dict[str, Any]):
+def _writers(out_dir: Path, grid: dict[str, Any], include_quadratic: bool):
     names = {
         "intercept_mm": "intercept_mm.tif",
-        "linear_rate_mm_yr": "linear_rate_mm_yr.tif",
-        "quadratic_coeff_mm_yr2": "quadratic_coeff_mm_yr2.tif",
+        "linear_coeff_mm_yr": "linear_coeff_mm_yr.tif",
         "start_rate_mm_yr": "start_rate_mm_yr.tif",
         "end_rate_mm_yr": "end_rate_mm_yr.tif",
-        "rate_change_mm_yr": "rate_change_mm_yr.tif",
-        "vertex_time_year": "vertex_time_year.tif",
         "annual_sin_mm": "annual_sin_mm.tif",
         "annual_cos_mm": "annual_cos_mm.tif",
         "annual_amplitude_mm": "annual_amplitude_mm.tif",
@@ -63,6 +26,13 @@ def _writers(out_dir: Path, grid: dict[str, Any]):
         "fit_rmse_mm": "fit_rmse_mm.tif",
         "n_observations": "n_observations.tif",
     }
+    if include_quadratic:
+        names.update({
+            "quadratic_coeff_mm_yr2": "quadratic_coeff_mm_yr2.tif",
+            "rate_change_mm_yr": "rate_change_mm_yr.tif",
+            "vertex_time_year": "vertex_time_year.tif",
+            "vertex_feature_year": "vertex_feature_year.tif",
+        })
     writers = {}
     base = {
         "driver": "GTiff",
@@ -88,6 +58,9 @@ def _writers(out_dir: Path, grid: dict[str, Any]):
 def decompose_insar(cfg: ProjectConfig) -> dict[str, Any]:
     sec = cfg.section("deformation")
     period = float(sec.get("annual_period_days", 365.2425))
+    degree = int(sec.get("polynomial_degree", 2))
+    if degree not in {1, 2}:
+        raise ValueError("v0.2 deformation.polynomial_degree supports 1 or 2")
     min_obs = int(sec.get("min_observations", 24))
     block_size = int(sec.get("block_size", 256))
     stack_path = cfg.outputs / "canonical" / "insar_stack.h5"
@@ -95,34 +68,54 @@ def decompose_insar(cfg: ProjectConfig) -> dict[str, Any]:
     out_dir = ensure_dir(cfg.outputs / "deformation")
 
     with h5py.File(stack_path, "r") as h5:
-        dates = days_to_dates(h5["date_days"][:])
-        X, t_year = design_matrix(dates, period)
+        all_dates = days_to_dates(h5["date_days"][:])
+        analysis = cfg.section("analysis")
+        start = np.datetime64(str(analysis.get("start_date", all_dates[0])), "D")
+        end = np.datetime64(str(analysis.get("end_date", all_dates[-1])), "D")
+        use = (all_dates >= start) & (all_dates <= end)
+        dates = all_dates[use]
+        if len(dates) < max(min_obs, 8):
+            raise ValueError("Too few InSAR epochs in analysis period")
+        model = TimeModel(polynomial_degree=degree, periods_days=(period,))
+        X, t_year = design_matrix(dates, model)
+        idx = coefficient_indices(model)
         duration = float(t_year[-1])
-        writers, names = _writers(out_dir, grid)
+        writers, names = _writers(out_dir, grid, include_quadratic=(degree >= 2))
         try:
             for r0, r1, c0, c1 in block_slices(grid["height"], grid["width"], block_size):
-                arr = h5["displacement_mm"][:, r0:r1, c0:c1].astype(float)
+                arr = h5["displacement_mm"][use, r0:r1, c0:c1].astype(float)
                 T, bh, bw = arr.shape
-                beta, rmse, n = fit_block(arr.reshape(T, -1), X, min_obs=min_obs)
+                beta, rmse, n, _rss = fit_block(arr.reshape(T, -1), X, min_obs=min_obs)
                 intercept = beta[:, 0]
                 b = beta[:, 1]
-                a = beta[:, 2]
-                s = beta[:, 3]
-                c = beta[:, 4]
-                start_rate = b
-                end_rate = b + 2.0 * a * duration
-                rate_change = end_rate - start_rate
-                vertex = np.where(np.abs(a) > 1e-12, -b / (2.0 * a), np.nan)
+                if degree >= 2:
+                    a = beta[:, 2]
+                    start_rate = b
+                    end_rate = b + 2.0 * a * duration
+                    rate_change = end_rate - start_rate
+                    raw_vertex = np.where(np.abs(a) > float(sec.get("vertex_min_abs_curvature", 1e-4)), -b / (2.0 * a), np.nan)
+                    # Preserve raw mathematical vertex and a finite feature for clustering.
+                    low = -duration
+                    high = 2.0 * duration
+                    vertex_feature = np.where(np.isfinite(raw_vertex), np.clip(raw_vertex, low, high), np.where(b >= 0, high, low))
+                else:
+                    a = None
+                    start_rate = b
+                    end_rate = b
+                    rate_change = None
+                    raw_vertex = None
+                    vertex_feature = None
+
+                pinfo = idx["periodic"][0]
+                s = beta[:, pinfo["sin"]]
+                c = beta[:, pinfo["cos"]]
                 amp = np.hypot(s, c)
-                phase = (np.arctan2(s, c) * period / (2.0*np.pi)) % period
-                block = {
+                phase = (np.arctan2(s, c) * period / (2.0 * np.pi)) % period
+                out = {
                     "intercept_mm": intercept,
-                    "linear_rate_mm_yr": b,
-                    "quadratic_coeff_mm_yr2": a,
+                    "linear_coeff_mm_yr": b,
                     "start_rate_mm_yr": start_rate,
                     "end_rate_mm_yr": end_rate,
-                    "rate_change_mm_yr": rate_change,
-                    "vertex_time_year": vertex,
                     "annual_sin_mm": s,
                     "annual_cos_mm": c,
                     "annual_amplitude_mm": amp,
@@ -130,8 +123,15 @@ def decompose_insar(cfg: ProjectConfig) -> dict[str, Any]:
                     "fit_rmse_mm": rmse,
                     "n_observations": n,
                 }
+                if degree >= 2:
+                    out.update({
+                        "quadratic_coeff_mm_yr2": a,
+                        "rate_change_mm_yr": rate_change,
+                        "vertex_time_year": raw_vertex,
+                        "vertex_feature_year": vertex_feature,
+                    })
                 win = rasterio.windows.Window(c0, r0, c1-c0, r1-r0)
-                for key, values in block.items():
+                for key, values in out.items():
                     data = values.reshape(bh, bw)
                     if key == "n_observations":
                         writers[key].write(data.astype("uint16"), 1, window=win)
@@ -144,8 +144,10 @@ def decompose_insar(cfg: ProjectConfig) -> dict[str, Any]:
     summary = {
         "status": "ok",
         "output_directory": str(out_dir),
-        "model": "quadratic_plus_annual_harmonic",
+        "model": f"polynomial_degree_{degree}_plus_annual_harmonic",
         "n_epochs": int(len(dates)),
+        "first_date": str(dates[0]),
+        "last_date": str(dates[-1]),
         "period_days": period,
         "duration_years": duration,
         "products": names,

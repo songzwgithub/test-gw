@@ -8,13 +8,13 @@ from .deformation.decompose import decompose_insar
 from .deformation.regimes import classify_deformation
 from .extensometer.analysis import analyze_extensometer
 from .groundwater.field import build_groundwater_field
-from .hydromechanics.seasonal import compute_groundwater_harmonics, estimate_lag_and_ske
+from .hydromechanics.seasonal import compute_joint_harmonics, estimate_lag
+from .hydromechanics.storativity import estimate_regularized_ske
 from .hydrostratigraphy.analysis import analyze_hydrostratigraphy
 from .io.groundwater import prepare_groundwater
 from .io.insar import prepare_insar
 from .storage.budget import compute_storage_budget
 from .synthesis import synthesize
-
 
 STAGES = OrderedDict([
     ("prepare-insar", prepare_insar),
@@ -22,8 +22,9 @@ STAGES = OrderedDict([
     ("build-groundwater-field", build_groundwater_field),
     ("decompose-insar", decompose_insar),
     ("classify-deformation", classify_deformation),
-    ("groundwater-harmonics", compute_groundwater_harmonics),
-    ("estimate-ske", estimate_lag_and_ske),
+    ("joint-harmonics", compute_joint_harmonics),
+    ("estimate-lag", estimate_lag),
+    ("estimate-ske", estimate_regularized_ske),
     ("storage-budget", compute_storage_budget),
     ("hydrostratigraphy", analyze_hydrostratigraphy),
     ("extensometer", analyze_extensometer),

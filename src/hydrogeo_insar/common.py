@@ -76,6 +76,14 @@ def write_tif(path: str | Path, array: np.ndarray, crs: str, transform: Affine, 
         dst.write(arr.astype(dtype, copy=False), 1)
 
 
+def read_tif(path: str | Path, dtype=float) -> np.ndarray:
+    with rasterio.open(path) as src:
+        arr = src.read(1).astype(dtype)
+        if src.nodata is not None:
+            arr[arr == src.nodata] = np.nan
+    return arr
+
+
 def aligned_raster(path: str | Path, dst_height: int, dst_width: int, dst_crs: str, dst_transform: Affine, resampling=Resampling.bilinear) -> np.ndarray:
     with rasterio.open(path) as src:
         src_arr = src.read(1).astype("float32")
@@ -97,10 +105,17 @@ def aligned_raster(path: str | Path, dst_height: int, dst_width: int, dst_crs: s
 
 
 def pixel_area_rows(height: int, width: int, crs: str, transform: Affine) -> np.ndarray:
-    """Return pixel area (m²) for each raster row, assuming north-up rasters."""
+    """Pixel area (m²) for each row; intended for north-up rasters in metre or geographic CRS."""
     crs_obj = CRS.from_user_input(crs)
     if not crs_obj.is_geographic:
-        return np.full(height, abs(transform.a * transform.e - transform.b * transform.d), dtype=float)
+        unit_factor = 1.0
+        if crs_obj.axis_info:
+            # Convert projected coordinate units to metres when possible.
+            factor = crs_obj.axis_info[0].unit_conversion_factor
+            if factor:
+                unit_factor = float(factor)
+        area_native = abs(transform.a * transform.e - transform.b * transform.d)
+        return np.full(height, area_native * unit_factor**2, dtype=float)
 
     geod = Geod(ellps="WGS84")
     areas = np.empty(height, dtype=float)

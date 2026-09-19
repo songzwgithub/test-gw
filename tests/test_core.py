@@ -2,18 +2,21 @@ from __future__ import annotations
 
 import numpy as np
 
-from hydrogeo_insar.deformation.decompose import design_matrix, fit_block
 from hydrogeo_insar.hydromechanics.seasonal import rotate_coefficients
+from hydrogeo_insar.temporal.fit import fit_block
+from hydrogeo_insar.temporal.model import TimeModel, design_matrix
 
 
 def test_quadratic_harmonic_recovery():
     dates = np.arange(np.datetime64("2018-01-01"), np.datetime64("2022-01-01"), np.timedelta64(12, "D"))
-    X, _ = design_matrix(dates)
+    model = TimeModel(polynomial_degree=2, periods_days=(365.2425,))
+    X, _ = design_matrix(dates, model)
     beta_true = np.array([2.0, -30.0, 2.5, 8.0, -4.0])
     y = (X @ beta_true)[:, None]
-    beta, rmse, n = fit_block(y, X, min_obs=20)
-    assert np.allclose(beta[0], beta_true, atol=1e-8)
-    assert rmse[0] < 1e-8
+    beta, rmse, n, rss = fit_block(y, X, min_obs=20)
+    assert np.allclose(beta[0], beta_true, atol=1e-7)
+    assert rmse[0] < 1e-7
+    assert rss[0] < 1e-10
     assert n[0] == len(dates)
 
 

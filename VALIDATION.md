@@ -1,17 +1,35 @@
-# v0.1 validation
+# v0.2 validation
 
-The first version was smoke-tested with a synthetic 20×20 raster, 31 InSAR epochs, and 12 confined wells.
+Validation was executed on a reproducible synthetic end-to-end case included in:
 
-Synthetic truth used:
+```text
+tests/integration/test_full_pipeline.py
+```
 
-- groundwater annual forcing with a 50-day deformation lag;
-- effective skeletal storativity `Ske = 0.002`;
-- spatially varying long-term subsidence.
+Synthetic truth:
 
-Recovered by the full pipeline:
+- common-reference cumulative vertical InSAR GeoTIFF series;
+- daily confined-head observations at 12 wells;
+- annual groundwater forcing;
+- deformation response lag = **50 days**;
+- effective elastic skeletal storativity = **0.002**;
+- two spatially different long-term deformation regimes.
 
-- lag = `50.0 days`;
-- median `Ske = 0.00201145`;
-- all stages from InSAR ingestion through storage budget and synthesis completed successfully.
+Recovered by the complete pipeline through storage-budget:
 
-Unit tests: `3 passed`.
+- regional lag = **50.0 days**;
+- median regularized Ske = **0.00199963**;
+- groundwater spatial-CV RMSE = **0.0839 m** for the synthetic setup;
+- storage identity satisfied numerically: `V_total = V_recoverable + V_irreversible`.
+
+Automated tests:
+
+```text
+4 passed
+```
+
+Run with:
+
+```bash
+PYTHONPATH=src python -m pytest -q
+```

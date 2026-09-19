@@ -4,10 +4,9 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-import rasterio
 from scipy.stats import spearmanr
 
-from ..common import aligned_raster, ensure_dir, h5_grid_metadata, write_json, write_tif
+from ..common import aligned_raster, ensure_dir, h5_grid_metadata, read_tif, write_json, write_tif
 from ..config import ProjectConfig
 
 
@@ -21,73 +20,60 @@ def analyze_hydrostratigraphy(cfg: ProjectConfig) -> dict[str, Any]:
 
     grid = h5_grid_metadata(cfg.outputs / "canonical" / "insar_stack.h5")
     out_dir = ensure_dir(cfg.outputs / "hydrostratigraphy")
-    with rasterio.open(cfg.outputs / "seasonal" / "ske_effective.tif") as src:
-        ske = src.read(1).astype(float)
-        if src.nodata is not None:
-            ske[ske == src.nodata] = np.nan
-    with rasterio.open(cfg.outputs / "storage" / "irreversible_storage_loss_mm.tif") as src:
-        loss = src.read(1).astype(float)
-        if src.nodata is not None:
-            loss[loss == src.nodata] = np.nan
-    cluster_path = cfg.outputs / "regimes" / "deformation_regime_id.tif"
-    clusters = None
-    if cluster_path.exists():
-        with rasterio.open(cluster_path) as src:
-            clusters = src.read(1).astype(int)
+    ske = read_tif(cfg.outputs / "seasonal" / "ske_effective.tif")
+    irr = read_tif(cfg.outputs / "storage" / "irreversible_gws_change_equivalent_mm.tif")
+    clusters_path = cfg.outputs / "regimes" / "deformation_regime_id.tif"
+    clusters = read_tif(clusters_path) if clusters_path.exists() else None
 
-    correlation_rows = []
-    cluster_rows = []
-    total_clay = np.zeros((grid["height"], grid["width"]), dtype="float64")
-    total_sand = np.zeros_like(total_clay)
-    total_valid = np.zeros_like(total_clay, dtype=bool)
+    h, w = grid["height"], grid["width"]
+    total_clay = np.zeros((h, w), dtype=float)
+    total_sand = np.zeros((h, w), dtype=float)
+    valid_count = np.zeros((h, w), dtype=np.uint16)
+    corr_rows, cluster_rows = [], []
 
     for layer in layers:
         lid = str(layer["id"])
-        sand = aligned_raster(cfg.resolve(layer["sand"]), grid["height"], grid["width"], grid["crs"], grid["transform"])
-        clay = aligned_raster(cfg.resolve(layer["clay"]), grid["height"], grid["width"], grid["crs"], grid["transform"])
+        sand = aligned_raster(cfg.resolve(layer["sand"]), h, w, grid["crs"], grid["transform"])
+        clay = aligned_raster(cfg.resolve(layer["clay"]), h, w, grid["crs"], grid["transform"])
+        valid = np.isfinite(sand) & np.isfinite(clay)
         denom = sand + clay
-        clay_fraction = np.where(np.isfinite(denom) & (denom > 0), clay / denom, np.nan)
+        frac = np.where(valid & (denom > 0), clay / denom, np.nan)
         write_tif(out_dir / f"sand_thickness_{lid}.tif", sand, grid["crs"], grid["transform"])
         write_tif(out_dir / f"clay_thickness_{lid}.tif", clay, grid["crs"], grid["transform"])
-        write_tif(out_dir / f"clay_fraction_{lid}.tif", clay_fraction, grid["crs"], grid["transform"])
-        v = np.isfinite(sand) & np.isfinite(clay)
-        total_clay[v] += clay[v]
-        total_sand[v] += sand[v]
-        total_valid |= v
+        write_tif(out_dir / f"clay_fraction_{lid}.tif", frac, grid["crs"], grid["transform"])
+        total_sand[valid] += sand[valid]
+        total_clay[valid] += clay[valid]
+        valid_count[valid] += 1
 
-        for target_name, target in [("ske_effective", ske), ("irreversible_storage_loss_mm", loss)]:
-            for metric_name, metric in [("sand_thickness_m", sand), ("clay_thickness_m", clay), ("clay_fraction", clay_fraction)]:
+        targets = [("ske_effective", ske), ("irreversible_gws_change_mm", irr)]
+        metrics = [("sand_thickness_m", sand), ("clay_thickness_m", clay), ("clay_fraction", frac)]
+        for tname, target in targets:
+            for mname, metric in metrics:
                 m = np.isfinite(metric) & np.isfinite(target)
-                rho, p = spearmanr(metric[m], target[m]) if m.sum() >= 10 else (np.nan, np.nan)
-                correlation_rows.append({
-                    "layer_id": lid,
-                    "metric": metric_name,
-                    "target": target_name,
-                    "n": int(m.sum()),
-                    "spearman_rho": float(rho) if np.isfinite(rho) else np.nan,
-                    "p_value": float(p) if np.isfinite(p) else np.nan,
-                })
+                rho = float(spearmanr(metric[m], target[m]).statistic) if m.sum() >= 10 else np.nan
+                corr_rows.append({"layer_id": lid, "metric": mname, "target": tname, "n": int(m.sum()), "spearman_rho": rho})
         if clusters is not None:
-            for cid in sorted(int(v) for v in np.unique(clusters) if v > 0):
-                m = (clusters == cid) & np.isfinite(sand) & np.isfinite(clay)
+            for cid in sorted(int(v) for v in np.unique(clusters[np.isfinite(clusters)]) if v > 0):
+                m = valid & (clusters == cid)
                 cluster_rows.append({
-                    "cluster_id": cid,
-                    "layer_id": lid,
-                    "n": int(m.sum()),
+                    "cluster_id": cid, "layer_id": lid, "n": int(m.sum()),
                     "sand_median_m": float(np.nanmedian(sand[m])) if m.any() else np.nan,
                     "clay_median_m": float(np.nanmedian(clay[m])) if m.any() else np.nan,
-                    "clay_fraction_median": float(np.nanmedian(clay_fraction[m])) if m.any() else np.nan,
+                    "clay_fraction_median": float(np.nanmedian(frac[m])) if m.any() else np.nan,
                 })
 
-    total_clay[~total_valid] = np.nan
-    total_sand[~total_valid] = np.nan
-    total_frac = total_clay / np.maximum(total_clay + total_sand, 1e-12)
+    required = len(layers)
+    complete = valid_count == required
+    total_clay[~complete] = np.nan
+    total_sand[~complete] = np.nan
+    total_frac = np.where(complete & ((total_clay + total_sand) > 0), total_clay / (total_clay + total_sand), np.nan)
+    write_tif(out_dir / "valid_layer_count.tif", valid_count, grid["crs"], grid["transform"], nodata=0, dtype="uint16")
     write_tif(out_dir / "total_clay_thickness_m.tif", total_clay.astype("float32"), grid["crs"], grid["transform"])
     write_tif(out_dir / "total_sand_thickness_m.tif", total_sand.astype("float32"), grid["crs"], grid["transform"])
     write_tif(out_dir / "total_clay_fraction.tif", total_frac.astype("float32"), grid["crs"], grid["transform"])
-    pd.DataFrame(correlation_rows).to_csv(out_dir / "hydrostratigraphy_correlations.csv", index=False)
+    pd.DataFrame(corr_rows).to_csv(out_dir / "hydrostratigraphy_correlations.csv", index=False)
     if cluster_rows:
         pd.DataFrame(cluster_rows).to_csv(out_dir / "hydrostratigraphy_by_cluster.csv", index=False)
-    result = {"status": "ok", "layers": [str(x["id"]) for x in layers], "output_directory": str(out_dir)}
+    result = {"status": "ok", "layers": [str(x["id"]) for x in layers], "complete_layer_pixels": int(complete.sum()), "output_directory": str(out_dir)}
     write_json(out_dir / "hydrostratigraphy_summary.json", result)
     return result

@@ -1,5 +1,5 @@
 project:
-  name: hengshui_example
+  name: hengshui_v2
   root: ..
 
 outputs: outputs
@@ -8,6 +8,7 @@ analysis:
   start_date: 2018-01-01
   end_date: 2025-12-31
 
+# INPUT FORMAT INTENTIONALLY FOLLOWS v0.1 / test-gw.
 insar:
   path: data/raw/insar
   pattern: "geo_*.tif"
@@ -36,32 +37,40 @@ groundwater:
 
 groundwater_field:
   aquifer: confined
-  rank: 4
   max_gap_days: 7
-  svd_iterations: 12
+  min_coverage_fraction: 0.50
+  min_baseline_observations: 6
+  coordinate_tolerance_deg: 0.00001
+  svd_iterations: 20
   projected_crs: null
   grid_block_size: 256
   baseline:
     start: 2018-01-01
     end: 2018-12-31
+  rank_candidates: [3, 4, 5, 6]
   rbf:
     max_centers: 32
-    sigma_km: null
-    ridge: 0.001
+    sigma_km_candidates: [15, 25, 35, 50]
+    ridge_candidates: [0.0001, 0.001, 0.01]
+  cross_validation:
+    folds: 5
+    block_km: 30
+    random_state: 20260919
+  support:
+    # null = convex hull only. Set a value to also limit nearest-well distance.
+    max_nearest_well_km: null
 
 deformation:
+  polynomial_degree: 2
   annual_period_days: 365.2425
   min_observations: 24
+  vertex_min_abs_curvature: 0.0001
   block_size: 256
 
 regimes:
-  features:
-    - quadratic_coeff_mm_yr2
-    - start_rate_mm_yr
-    - end_rate_mm_yr
-    - rate_change_mm_yr
-    - vertex_time_year
-  k_candidates: [3, 4, 5]
+  feature_scheme: meng2026
+  k_candidates: [2, 3, 4, 5, 6]
+  k: null
   random_state: 20260919
   selection_sample_size: 50000
   stable_rate_mm_yr: 5.0
@@ -70,22 +79,33 @@ regimes:
 seasonal_response:
   annual_period_days: 365.2425
   min_observations: 24
+  block_size: 256
+  deformation_polynomial_degree: 2
+  groundwater_polynomial_degree: auto
+  groundwater_polynomial_candidates: [1, 2]
+  model_selection_sample_size: 3000
   min_head_amplitude_m: 0.2
   min_deformation_amplitude_mm: 0.5
   lag_search_days: [0, 180]
   lag_step_days: 0.5
   lag_sample_size: 200000
   random_state: 20260919
-  block_size: 256
 
 ske:
   min: 0.0
   max: 0.05
-  support_sigma_pixels: 0.0
+  support_stride_pixels: 16
+  support_min_fraction: 0.25
+  min_data_pixels_per_support_cell: 4
+  lambda: null
+  lambda_candidates: [0.1, 1.0, 10.0, 100.0]
+  cv_block_cells: 3
 
 storage:
+  partition_model: jiang2018
   baseline_date: 2018-01-01
   end_date: null
+  valid_fraction: 0.90
 
 hydrostratigraphy:
   enabled: false
@@ -100,6 +120,7 @@ hydrostratigraphy:
 extensometer:
   enabled: false
   path: data/raw/extensometer.csv
+  measurement_type: interval_compaction
   lon: null
   lat: null
   fields:

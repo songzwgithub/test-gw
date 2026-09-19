@@ -13,12 +13,13 @@ from sklearn.preprocessing import StandardScaler
 from ..common import ensure_dir, write_json
 from ..config import ProjectConfig
 
+# Meng et al. (2026)-style feature set: a, b, t_vertex, terminal slope.
 FEATURE_FILES = {
     "quadratic_coeff_mm_yr2": "quadratic_coeff_mm_yr2.tif",
-    "start_rate_mm_yr": "start_rate_mm_yr.tif",
+    "linear_coeff_mm_yr": "linear_coeff_mm_yr.tif",
+    "vertex_feature_year": "vertex_feature_year.tif",
     "end_rate_mm_yr": "end_rate_mm_yr.tif",
-    "rate_change_mm_yr": "rate_change_mm_yr.tif",
-    "vertex_time_year": "vertex_time_year.tif",
+    "start_rate_mm_yr": "start_rate_mm_yr.tif",
 }
 
 
@@ -34,17 +35,16 @@ def _read_feature_stack(deformation_dir: Path, feature_names: list[str]):
             if profile is None:
                 profile = src.profile.copy()
             arrays.append(arr)
-    stack = np.stack(arrays, axis=-1)
-    return stack, profile
+    return np.stack(arrays, axis=-1), profile
 
 
-def _suggest_label(end_rate: float, rate_change: float, stable_rate: float, strong_deceleration: float) -> str:
+def _suggest_label(start_rate: float, end_rate: float, stable_rate: float, decel_threshold: float) -> str:
     if end_rate > stable_rate:
         return "rebound"
     if abs(end_rate) <= stable_rate:
         return "stable"
-    if end_rate < -stable_rate and rate_change > strong_deceleration:
-        return "decelerating_subsidence"
+    if end_rate < -stable_rate and (end_rate - start_rate) > decel_threshold:
+        return "reduced_subsidence"
     return "continuous_subsidence"
 
 
@@ -52,16 +52,18 @@ def classify_deformation(cfg: ProjectConfig) -> dict[str, Any]:
     sec = cfg.section("regimes")
     deformation_dir = cfg.outputs / "deformation"
     out_dir = ensure_dir(cfg.outputs / "regimes")
-    feature_names = sec.get("features", [
+    scheme = str(sec.get("feature_scheme", "meng2026")).lower()
+    if scheme != "meng2026":
+        raise ValueError("v0.2 currently supports regimes.feature_scheme='meng2026'")
+    feature_names = [
         "quadratic_coeff_mm_yr2",
-        "start_rate_mm_yr",
+        "linear_coeff_mm_yr",
+        "vertex_feature_year",
         "end_rate_mm_yr",
-        "rate_change_mm_yr",
-        "vertex_time_year",
-    ])
-    feature_names = [f for f in feature_names if f in FEATURE_FILES]
+    ]
     data, profile = _read_feature_stack(deformation_dir, feature_names)
-    valid = np.isfinite(data).all(axis=-1)
+    start_rate = _read_feature_stack(deformation_dir, ["start_rate_mm_yr"])[0][..., 0]
+    valid = np.isfinite(data).all(axis=-1) & np.isfinite(start_rate)
     X = data[valid]
     if len(X) < 100:
         raise ValueError("Too few valid pixels for deformation clustering")
@@ -75,7 +77,9 @@ def classify_deformation(cfg: ProjectConfig) -> dict[str, Any]:
         sample_idx = rng.choice(sample_idx, max_samples, replace=False)
     Xsel = Xs[sample_idx]
 
-    candidates = [int(k) for k in sec.get("k_candidates", [3, 4, 5]) if int(k) >= 2]
+    candidates = [int(k) for k in sec.get("k_candidates", [2, 3, 4, 5, 6]) if 2 <= int(k) < len(Xsel)]
+    if not candidates:
+        raise ValueError("No valid K candidates for clustering")
     selection_rows = []
     best_k = None
     best_score = -np.inf
@@ -90,7 +94,7 @@ def classify_deformation(cfg: ProjectConfig) -> dict[str, Any]:
             best_score = sil
             best_k = k
 
-    k = int(sec.get("k", best_k)) if sec.get("k") is not None else int(best_k)
+    k = int(sec["k"]) if sec.get("k") is not None else int(best_k)
     model = KMeans(n_clusters=k, random_state=int(sec.get("random_state", 20260919)), n_init=30)
     labels = model.fit_predict(Xs)
 
@@ -103,22 +107,20 @@ def classify_deformation(cfg: ProjectConfig) -> dict[str, Any]:
         dst.write(cluster_map, 1)
 
     stable_rate = float(sec.get("stable_rate_mm_yr", 5.0))
-    strong_deceleration = float(sec.get("deceleration_threshold_mm_yr", 5.0))
-    summary_rows = []
+    decel_threshold = float(sec.get("deceleration_threshold_mm_yr", 5.0))
     flat_data = data[valid]
+    flat_start = start_rate[valid]
+    summary_rows = []
     for cid in range(k):
-        mask = labels == cid
-        med = {name: float(np.nanmedian(flat_data[mask, j])) for j, name in enumerate(feature_names)}
-        label = _suggest_label(
-            med.get("end_rate_mm_yr", np.nan),
-            med.get("rate_change_mm_yr", np.nan),
-            stable_rate,
-            strong_deceleration,
-        )
+        m = labels == cid
+        med = {name: float(np.nanmedian(flat_data[m, j])) for j, name in enumerate(feature_names)}
+        srate = float(np.nanmedian(flat_start[m]))
+        label = _suggest_label(srate, med["end_rate_mm_yr"], stable_rate, decel_threshold)
         summary_rows.append({
             "cluster_id": cid + 1,
             "suggested_label": label,
-            "pixel_count": int(mask.sum()),
+            "pixel_count": int(m.sum()),
+            "start_rate_mm_yr": srate,
             **med,
         })
 
@@ -126,14 +128,12 @@ def classify_deformation(cfg: ProjectConfig) -> dict[str, Any]:
     pd.DataFrame(summary_rows).to_csv(out_dir / "cluster_summary.csv", index=False)
     np.savez_compressed(
         out_dir / "clustering_model.npz",
-        mean=scaler.mean_,
-        scale=scaler.scale_,
-        centers=model.cluster_centers_,
-        feature_names=np.asarray(feature_names),
-        k=k,
+        mean=scaler.mean_, scale=scaler.scale_, centers=model.cluster_centers_,
+        feature_names=np.asarray(feature_names), k=k,
     )
     result = {
         "status": "ok",
+        "feature_scheme": "meng2026",
         "k": k,
         "selection_metric": "silhouette",
         "features": feature_names,

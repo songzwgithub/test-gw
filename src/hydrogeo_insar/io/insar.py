@@ -31,7 +31,24 @@ def discover_insar_files(directory: Path, pattern: str = "geo_*.tif", filename_r
     return rows
 
 
+def _canonical_sign(positive: str) -> float:
+    value = str(positive).strip().lower()
+    if value in {"uplift", "up", "positive_up", "positive=uplift"}:
+        return 1.0
+    if value in {"subsidence", "down", "positive_down", "positive=subsidence"}:
+        return -1.0
+    raise ValueError("insar.positive must state whether positive values mean 'uplift' or 'subsidence'")
+
+
 def prepare_insar(cfg: ProjectConfig) -> dict[str, Any]:
+    """Read corrected cumulative deformation GeoTIFFs into a canonical HDF5 stack.
+
+    V0.2 input contract:
+      * files are cumulative deformation relative to one common source reference date;
+      * values are already atmospherically/geodetically corrected upstream;
+      * storage calculations require vertical_displacement;
+      * internal sign convention is always positive=uplift, negative=subsidence.
+    """
     sec = cfg.section("insar")
     input_dir = cfg.resolve(sec["path"])
     pattern = sec.get("pattern", "geo_*.tif")
@@ -40,7 +57,19 @@ def prepare_insar(cfg: ProjectConfig) -> dict[str, Any]:
     if unit not in UNIT_TO_MM:
         raise ValueError(f"Unsupported InSAR unit: {unit}")
     scale = UNIT_TO_MM[unit]
+    sign = _canonical_sign(sec.get("positive", "uplift"))
     files = discover_insar_files(input_dir, pattern, regex)
+
+    refs = np.asarray([r[1] for r in files], dtype="datetime64[D]")
+    unique_refs = np.unique(refs)
+    if len(unique_refs) != 1:
+        raise ValueError(
+            "InSAR input must be a cumulative time series with one common reference date. "
+            f"Found {len(unique_refs)} reference dates in file names."
+        )
+    obs = np.asarray([r[0] for r in files], dtype="datetime64[D]")
+    if len(np.unique(obs)) != len(obs):
+        raise ValueError("Duplicate InSAR observation dates were found")
 
     out_dir = ensure_dir(cfg.outputs / "canonical")
     out_path = out_dir / "insar_stack.h5"
@@ -49,6 +78,8 @@ def prepare_insar(cfg: ProjectConfig) -> dict[str, Any]:
     with rasterio.open(files[0][2]) as src0:
         height, width = src0.height, src0.width
         transform, crs = src0.transform, str(src0.crs)
+        if crs in {"None", ""}:
+            raise ValueError("InSAR GeoTIFFs require a valid CRS")
 
     with h5py.File(out_path, "w") as h5:
         ds = h5.create_dataset(
@@ -60,15 +91,18 @@ def prepare_insar(cfg: ProjectConfig) -> dict[str, Any]:
             compression_opts=4,
             fillvalue=np.nan,
         )
-        h5.create_dataset("date_days", data=dates_to_days([r[0] for r in files]))
-        h5.create_dataset("source_reference_date_days", data=dates_to_days([r[1] for r in files]))
+        h5.create_dataset("date_days", data=dates_to_days(obs))
+        h5.create_dataset("source_reference_date_days", data=dates_to_days(refs))
         h5.attrs["height"] = height
         h5.attrs["width"] = width
         h5.attrs["crs"] = crs
         h5.attrs["transform"] = affine_to_list(transform)
         h5.attrs["unit"] = "mm"
         h5.attrs["quantity"] = sec.get("quantity", "vertical_displacement")
-        h5.attrs["positive"] = sec.get("positive", "uplift")
+        h5.attrs["positive"] = "uplift"
+        h5.attrs["source_positive"] = sec.get("positive", "uplift")
+        h5.attrs["common_reference_date"] = str(unique_refs[0])
+        h5.attrs["input_semantics"] = "cumulative_deformation_relative_to_common_reference_date"
 
         for i, (_, _, path) in enumerate(files):
             with rasterio.open(path) as src:
@@ -77,19 +111,21 @@ def prepare_insar(cfg: ProjectConfig) -> dict[str, Any]:
                 arr = src.read(1).astype("float32")
                 if src.nodata is not None:
                     arr[arr == src.nodata] = np.nan
-                ds[i] = arr * scale
+                ds[i] = arr * scale * sign
 
     manifest = {
         "status": "ok",
         "input_directory": str(input_dir),
         "output": str(out_path),
         "n_epochs": len(files),
-        "first_date": str(files[0][0]),
-        "last_date": str(files[-1][0]),
+        "first_date": str(obs[0]),
+        "last_date": str(obs[-1]),
+        "reference_date": str(unique_refs[0]),
         "shape": [height, width],
         "crs": crs,
         "unit": "mm",
-        "positive": sec.get("positive", "uplift"),
+        "quantity": sec.get("quantity", "vertical_displacement"),
+        "positive": "uplift",
     }
     write_json(out_dir / "insar_manifest.json", manifest)
     return manifest

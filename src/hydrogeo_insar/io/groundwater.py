@@ -43,7 +43,7 @@ def _build_long_from_wide(frame: pd.DataFrame, sec: dict[str, Any]) -> pd.DataFr
     missing = [key for key in required if key not in fields]
     if missing:
         raise ValueError(f"groundwater.fields missing keys: {missing}")
-    source_meta = [fields[k] for k in fields if k != "value" and k != "date"]
+    source_meta = [fields[k] for k in fields if k not in {"value", "date"}]
     date_cols = _date_like_columns(frame.columns)
     if not date_cols:
         raise ValueError("No date columns detected in wide groundwater table")
@@ -51,8 +51,7 @@ def _build_long_from_wide(frame: pd.DataFrame, sec: dict[str, Any]) -> pd.DataFr
     rename = {v: k for k, v in fields.items() if v in meta.columns}
     meta = meta.rename(columns=rename)
     wide = pd.concat([meta, frame[date_cols]], axis=1)
-    long = wide.melt(id_vars=list(meta.columns), value_vars=date_cols, var_name="date", value_name="value")
-    return long
+    return wide.melt(id_vars=list(meta.columns), value_vars=date_cols, var_name="date", value_name="value")
 
 
 def _build_long_from_long(frame: pd.DataFrame, sec: dict[str, Any]) -> pd.DataFrame:
@@ -62,11 +61,11 @@ def _build_long_from_long(frame: pd.DataFrame, sec: dict[str, Any]) -> pd.DataFr
     if missing:
         raise ValueError(f"groundwater.fields missing keys: {missing}")
     source = [fields[k] for k in fields]
-    out = frame[source].rename(columns={v: k for k, v in fields.items()})
-    return out
+    return frame[source].rename(columns={v: k for k, v in fields.items()})
 
 
 def prepare_groundwater(cfg: ProjectConfig) -> dict[str, Any]:
+    """Read groundwater using the proven v0.1 wide/long contracts, without new input formats."""
     sec = cfg.section("groundwater")
     path = cfg.resolve(sec["path"])
     frame = _read_table(path, sec.get("sheet_name"))
@@ -97,7 +96,6 @@ def prepare_groundwater(cfg: ProjectConfig) -> dict[str, Any]:
         if "elevation_m" not in long.columns:
             raise ValueError("elevation_m is required when groundwater.variable=depth_to_water")
         long["head_m"] = long["elevation_m"] - long["value"]
-        # Minimal physical cleaning only.
         long.loc[long["value"] < float(sec.get("minimum_water_depth_m", -0.5)), "head_m"] = np.nan
         if "well_depth_m" in long.columns:
             long.loc[long["value"] > long["well_depth_m"], "head_m"] = np.nan
