@@ -1,0 +1,18 @@
+# Merge this block into the project configuration.
+extensometer:
+  enabled: true
+  format: marker_table
+  path: data/raw/数据2003-2021.csv
+  date_column: 标孔
+  depth_row_label: 深度（m）
+  marker_columns: [F1, F2, F3, F4]
+
+  # The uploaded table has negative values for settlement and F4=0,
+  # so the marker values are already consistent with positive-upward displacement.
+  marker_positive: uplift
+
+  # Site coordinates are needed only for InSAR/GW collocation.
+  lon: null
+  lat: null
+  comparison_radius_m: 500
+  overlap_max_gap_days: 45
