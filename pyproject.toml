@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hydrogeo-insar"
-version = "0.3.1"
-description = "Reproducible hydrogeodetic analysis from corrected cumulative InSAR GeoTIFF time series and groundwater observations"
+version = "0.4.0"
+description = "Pixelwise hydrogeodetic analysis from corrected cumulative InSAR and groundwater observations"
 requires-python = ">=3.10"
 dependencies = [
   "numpy>=1.26",

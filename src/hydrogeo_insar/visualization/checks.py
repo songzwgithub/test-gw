@@ -88,8 +88,22 @@ def _plot_prepare_groundwater(cfg: ProjectConfig) -> list[str]:
     path = cfg.outputs / "canonical" / "groundwater.csv"
     if not path.exists(): return []
     df = pd.read_csv(path, parse_dates=["date"])
-    wells = df.groupby("station_id", as_index=False).agg(lon=("lon","first"), lat=("lat","first"), n=("date","count"))
-    monthly = df.assign(month=df["date"].dt.to_period("M").dt.to_timestamp()).groupby("month")["station_id"].nunique()
+    valid = df[np.isfinite(df["head_m"])].copy()
+
+    wells = (
+        df.groupby("station_id", as_index=False)
+        .agg(
+            lon=("lon", "first"),
+            lat=("lat", "first"),
+            n=("head_m", "count"),
+        )
+    )
+
+    monthly = (
+        valid.assign(month=valid["date"].dt.to_period("M").dt.to_timestamp())
+        .groupby("month")["station_id"]
+        .nunique()
+    )
     fig, axes = plt.subplots(1,2,figsize=(10,4))
     sc=axes[0].scatter(wells["lon"], wells["lat"], c=wells["n"], s=28)
     axes[0].set_title(f"Groundwater wells (n={len(wells)})"); axes[0].set_xlabel("Longitude"); axes[0].set_ylabel("Latitude")
@@ -118,12 +132,67 @@ def _plot_groundwater_field(cfg: ProjectConfig) -> list[str]:
 
 
 def _plot_deformation(cfg: ProjectConfig) -> list[str]:
-    base=cfg.outputs/"deformation"; paths=[base/"end_rate_mm_yr.tif",base/"annual_amplitude_mm.tif",base/"fit_rmse_mm.tif"]
-    if not all(p.exists() for p in paths): return []
-    arr=[_decimate(read_tif(p),cfg) for p in paths]; fig,axes=plt.subplots(1,3,figsize=(12,4))
-    _imshow(axes[0],arr[0],"End rate (mm/yr)","RdBu",True); _imshow(axes[1],arr[1],"Annual amplitude (mm)"); _imshow(axes[2],arr[2],"Fit RMSE (mm)")
-    return [_save(fig,_figure_dir(cfg)/"04_deformation_decomposition.png",cfg)]
+    base = cfg.outputs / "deformation"
 
+    main_paths = [
+        base / "end_rate_mm_yr.tif",
+        base / "annual_amplitude_mm.tif",
+        base / "fit_rmse_mm.tif",
+    ]
+    if not all(p.exists() for p in main_paths):
+        return []
+
+    arr = [_decimate(read_tif(p), cfg) for p in main_paths]
+    fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+    _imshow(axes[0], arr[0], "End rate (mm/yr)", "RdBu", True)
+    _imshow(axes[1], arr[1], "Annual amplitude (mm)")
+    _imshow(axes[2], arr[2], "Fit RMSE (mm)")
+    outputs = [
+        _save(
+            fig,
+            _figure_dir(cfg) / "04_deformation_decomposition.png",
+            cfg,
+        )
+    ]
+
+    delta_path = base / "delta_bic_linear_minus_quadratic.tif"
+    pref_path = base / "preferred_model.tif"
+    evidence_path = base / "bic_evidence_class.tif"
+
+    if delta_path.exists() and pref_path.exists() and evidence_path.exists():
+        delta = _decimate(read_tif(delta_path), cfg)
+        pref = _decimate(read_tif(pref_path), cfg)
+        evidence = _decimate(read_tif(evidence_path), cfg)
+
+        fig, axes = plt.subplots(1, 3, figsize=(12, 4))
+        _imshow(
+            axes[0],
+            delta,
+            "ΔBIC = BIC linear - BIC quadratic",
+            "RdBu",
+            True,
+        )
+        _imshow(
+            axes[1],
+            pref,
+            "Preferred model\n1=linear, 2=quadratic",
+            categorical=True,
+        )
+        _imshow(
+            axes[2],
+            evidence,
+            "BIC evidence\n1=linear, 2=weak, 3=quadratic",
+            categorical=True,
+        )
+        outputs.append(
+            _save(
+                fig,
+                _figure_dir(cfg) / "04b_deformation_model_selection.png",
+                cfg,
+            )
+        )
+
+    return outputs
 
 def _plot_regimes(cfg: ProjectConfig) -> list[str]:
     mp=cfg.outputs/"regimes"/"deformation_regime_id.tif"
@@ -158,25 +227,59 @@ def _plot_lag(cfg: ProjectConfig) -> list[str]:
 
 
 def _plot_ske(cfg: ProjectConfig) -> list[str]:
-    b=cfg.outputs/"seasonal"; ps=[b/"ske_effective.tif",b/"seasonal_vector_cosine.tif",b/"ske_data_support_mask.tif",b/"ske_support_mask.tif"]
-    if not ps[0].exists(): return []
-    fig,axes=plt.subplots(2,2,figsize=(9,7))
-    _imshow(axes[0,0],_decimate(read_tif(ps[0]),cfg),"Effective Ske")
-    if ps[1].exists(): _imshow(axes[0,1],_decimate(read_tif(ps[1]),cfg),"Seasonal vector cosine","RdBu",False)
-    else: axes[0,1].axis("off")
-    if ps[2].exists(): _imshow(axes[1,0],_decimate(read_tif(ps[2]),cfg),"Ske data support",categorical=True)
-    else: axes[1,0].axis("off")
-    if ps[3].exists(): _imshow(axes[1,1],_decimate(read_tif(ps[3]),cfg),"Ske solution support",categorical=True)
-    else: axes[1,1].axis("off")
-    outputs=[_save(fig,_figure_dir(cfg)/"08a_ske_field.png",cfg)]
-    cv=b/"ske_model_cv.csv"
-    if cv.exists():
-        t=pd.read_csv(cv); fig,ax=plt.subplots(figsize=(7,4))
-        for lam,g in t.groupby("lambda"): ax.plot(g["node_spacing_km"],g["cv_deformation_rmse_m"],marker="o",label=f"lambda={lam:g}")
-        ax.set_xlabel("Node spacing (km)"); ax.set_ylabel("CV deformation RMSE (m)"); ax.set_title("Ske spatial CV"); ax.legend(fontsize=8)
-        outputs.append(_save(fig,_figure_dir(cfg)/"08b_ske_cv.png",cfg))
-    return outputs
+    b = cfg.outputs / "seasonal"
+    primary = b / "ske_pixelwise.tif"
+    cosine = b / "seasonal_vector_cosine.tif"
+    support = b / "ske_pixelwise_support_mask.tif"
+    high_support = b / "ske_pixelwise_high_confidence_mask.tif"
+    if not primary.exists():
+        return []
 
+    fig, axes = plt.subplots(2, 2, figsize=(9, 7))
+    _imshow(
+        axes[0, 0],
+        _decimate(read_tif(primary), cfg),
+        "Pixelwise Ske",
+    )
+
+    if cosine.exists():
+        _imshow(
+            axes[0, 1],
+            _decimate(read_tif(cosine), cfg),
+            "Seasonal vector cosine",
+            "RdBu",
+            False,
+        )
+    else:
+        axes[0, 1].axis("off")
+
+    if support.exists():
+        _imshow(
+            axes[1, 0],
+            _decimate(read_tif(support), cfg),
+            "Pixelwise Ske support",
+            categorical=True,
+        )
+    else:
+        axes[1, 0].axis("off")
+
+    if high_support.exists():
+        _imshow(
+            axes[1, 1],
+            _decimate(read_tif(high_support), cfg),
+            "High-confidence Ske support",
+            categorical=True,
+        )
+    else:
+        axes[1, 1].axis("off")
+
+    return [
+        _save(
+            fig,
+            _figure_dir(cfg) / "08_ske_pixelwise.png",
+            cfg,
+        )
+    ]
 
 def _plot_storage(cfg: ProjectConfig) -> list[str]:
     b=cfg.outputs/"storage"; ps=[b/"irreversible_gws_change_equivalent_mm.tif",b/"recoverable_gws_change_equivalent_mm.tif",b/"head_lowfreq_change_m.tif"]

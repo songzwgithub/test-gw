@@ -1,5 +1,5 @@
 project:
-  name: hengshui_v3
+  name: example_project
   root: ..
 
 outputs: outputs
@@ -8,7 +8,6 @@ analysis:
   start_date: 2018-01-01
   end_date: 2025-12-31
 
-# Input readers intentionally follow the verified test-gw format.
 insar:
   path: data/raw/insar
   pattern: "geo_*.tif"
@@ -29,10 +28,10 @@ groundwater:
     lat: lat
     aquifer_class: layer
     well_depth_m: depth_m
-    elevation_m: 地面标高
+    elevation_m: elevation_m
   aquifer_labels:
-    承压水: confined
-    潜水: unconfined
+    confined: confined
+    unconfined: unconfined
   minimum_water_depth_m: -0.5
 
 groundwater_field:
@@ -71,21 +70,11 @@ deformation:
   vertex_min_abs_curvature: 0.0001
   block_size: 256
 
-regimes:
-  feature_scheme: meng2026
-  k_candidates: [2, 3, 4, 5, 6]
-  k: null
-  training_spacing_km: 2.0
-  selection_sample_size: 50000
-  predict_chunk_size: 200000
-  random_state: 20260919
-  stable_rate_mm_yr: 5.0
-  deceleration_threshold_mm_yr: 5.0
-
 seasonal_response:
   annual_period_days: 365.2425
   min_observations: 24
-  block_size: 256
+  block_size: 512
+  report_every_blocks: 5
   deformation_polynomial_degree: 2
   groundwater_polynomial_degree: auto
   groundwater_polynomial_candidates: [1, 2]
@@ -102,47 +91,29 @@ seasonal_response:
 ske:
   min: 0.0
   max: 0.05
-  observation_cell_km: 2.5
-  node_spacing_km_candidates: [10, 15, 20, 25]
-  basis_sigma_factor: 1.5
-  max_basis_neighbors: 12
-  max_extrapolation_km: 30
   min_vector_cosine: 0.0
-  lambda_candidates: [0.1, 1.0, 10.0, 100.0]
-  cv_block_km: 30
-  aggregation_block_size: 256
-  rasterize_block_size: 256
+  high_confidence_min_vector_cosine: 0.7
 
 storage:
   partition_model: jiang2018
+  ske_product: pixelwise
   annual_period_days: 365.2425
   baseline_date: 2018-01-01
   end_date: null
   valid_fraction: 0.90
   min_observations: 24
-  block_size: 128
+  block_size: 256
+  annual_map_block_size: 512
+  diagnostic_threshold_mm: 1.0
 
 hydrostratigraphy:
   enabled: false
-  layers:
-    - id: AQ1
-      sand: data/raw/geology/AQ1_sand_thickness.tif
-      clay: data/raw/geology/AQ1_clay_thickness.tif
-    - id: AQ2
-      sand: data/raw/geology/AQ2_sand_thickness.tif
-      clay: data/raw/geology/AQ2_clay_thickness.tif
+  layers: []
 
 extensometer:
   enabled: false
   path: data/raw/extensometer.csv
   measurement_type: interval_compaction
-  lon: null
-  lat: null
-  fields:
-    date: date
-    depth_top_m: depth_top_m
-    depth_bottom_m: depth_bottom_m
-    compaction_mm: compaction_mm
 
 visualization:
   dpi: 180

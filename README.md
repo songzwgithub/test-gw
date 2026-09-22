@@ -1,161 +1,136 @@
-# hydrogeo-insar v0.3.1
+# hydrogeo-insar v0.4.0
 
-V0.3 keeps the verified `test-gw` input formats and replaces the scientific core with a continuous-field hydrogeodetic workflow. The code is designed for corrected cumulative vertical InSAR GeoTIFF time series and regional groundwater monitoring networks.
+`hydrogeo-insar` is a reproducible hydrogeodetic workflow for combining corrected cumulative InSAR time series with groundwater observations. The v0.4 publication workflow makes **pixelwise** `Ske` and pixelwise storage partition the primary scientific products.
 
-## Input contract
-
-### InSAR
+## Publication workflow
 
 ```text
-geo_YYYYMMDD_YYYYMMDD.tif
-```
-
-All files are cumulative deformation relative to one common first date. The software does not re-reference the time series. Internally:
-
-```text
-positive = uplift
-negative = subsidence
-unit     = mm
-```
-
-### Groundwater
-
-Groundwater readers remain compatible with the verified v0.2/test-gw CSV/Excel wide/long formats. Aquifer classes are explicit; well depth is not used to infer aquifer group.
-
-## Scientific workflow
-
-```text
-corrected cumulative InSAR
+corrected vertical InSAR
         +
-confined groundwater observations
+groundwater observations
         |
-        +--> low-rank temporal model + Gaussian RBF spatial field
+        +--> regional groundwater field
         |
-        +--> quadratic + annual deformation model --> Meng-style regimes
+        +--> common-epoch annual harmonics
         |
-        +--> common-epoch annual harmonics --> regional lag
+        +--> quality-weighted regional lag
         |
-        +--> continuous bounded Ske field on physical-km basis nodes
+        +--> pixelwise Ske
         |
         +--> piecewise-linear low-frequency deformation/head
         |
-        +--> TGWS / RGWS / IGWS (Jiang-style partition)
+        +--> pixelwise total / recoverable / irreversible change
+        |
+        +--> annual pixelwise maps + regional volume integration
 ```
 
-## Main v0.3 changes
-
-1. Groundwater spatial model selection uses spatial block-CV and reports full-series RMSE, annual-amplitude RMSE, phase MAE and harmonic-vector RMSE.
-2. Groundwater model selection first keeps models within 5% of the minimum full-series RMSE, then selects the best annual harmonic reconstruction.
-3. Time functions support continuous piecewise-linear hinges in addition to polynomial and periodic terms.
-4. Deformation clustering keeps the Meng-style feature set but trains on a spatially balanced sample and predicts the full raster in chunks.
-5. The near-zero-curvature `t_vertex` feature bug is fixed.
-6. Pixel phase lag remains a diagnostic map; one quality-weighted regional lag is used in the Ske inversion.
-7. `Ske` is no longer estimated on pixel-count coarse cells. It is represented as a continuous normalized-RBF basis field with node spacing in kilometres, bounded coefficients and graph smoothing.
-8. Ske data support, Ske solution support and groundwater support are separate products. Ske extrapolation is limited by a physical distance from seasonal observations.
-9. Annual TGWS/RGWS/IGWS use a continuous piecewise-linear low-frequency model plus annual harmonic, rather than differences from one full-period quadratic trend.
-10. Storage output distinguishes signed irreversible change, net irreversible-loss magnitude and gross negative irreversible change.
-
-
-## v0.3.1 science fixes
-
-- Groundwater temporal interpolation no longer bridges long periods rejected by the active-well support criterion.
-- Regional lag and Ske weighting now include the held-out groundwater harmonic-vector CV RMSE as an uncertainty floor.
-- Ske fitting reports and uses the lag-corrected seasonal vector cosine so non-coherent seasonal response is not forced into near-zero storativity.
-- Storage cumulative and annual outputs now obey the configured `baseline_date` to `end_date` interval exactly.
-- Added an independent visualization module for stage-by-stage result checks. Scientific calculations do not depend on plotting.
-
-Plot all available checks:
-
-```bash
-hydrogeo-insar plot configs/example_project.yaml --stage all
-```
-
-Plot one stage:
-
-```bash
-hydrogeo-insar plot configs/example_project.yaml --stage estimate-ske
-```
-
-Figures are written to `outputs/figures/checks/` by default.
+The default workflow deliberately excludes deformation clustering and the older regularized-RBF `Ske` estimator. Those are retained only as optional sensitivity/legacy stages.
 
 ## Core equations
 
-Seasonal response:
+For each pixel, with the groundwater annual harmonic rotated by the regional lag:
 
 ```text
-d_A(x) = Ske(x) * R(tau_region) * h_A(x)
+Ske = (d · h_tau) / (h_tau · h_tau)
 ```
 
-Continuous Ske parameterization:
+The low-frequency storage partition is:
 
 ```text
-Ske(x) = sum_j B_j(x) beta_j
+Delta b_total        = observed low-frequency vertical deformation
+Delta b_recoverable  = Ske * Delta h_lowfreq
+Delta b_irreversible = Delta b_total - Delta b_recoverable
 ```
 
-where normalized RBF basis functions satisfy `B_j >= 0` and `sum_j B_j = 1`. The inversion minimizes harmonic deformation misfit plus graph smoothing with bounded `beta_j`.
-
-Jiang-style storage partition:
+Regional volumes are integrated **after** pixelwise calculation:
 
 ```text
-V_total       = integral Delta d_lowfreq dA
-V_recoverable = integral Ske * Delta h_lowfreq dA
-V_irreversible = V_total - V_recoverable
+V = sum(Delta b * pixel_area)
 ```
 
-`V_irreversible` remains signed. Negative values indicate irreversible storage depletion.
+Sign convention: positive displacement is uplift; negative is subsidence. Negative irreversible change denotes residual compaction/storage depletion within the adopted Jiang-style partition.
 
-## Run
+## Install and run
 
 ```bash
 pip install -e .
 hydrogeo-insar run configs/example_project.yaml
 ```
 
-Stages:
+Continue from the hydrogeodetic core:
+
+```bash
+hydrogeo-insar run configs/example_project.yaml --from joint-harmonics
+```
+
+List stages:
+
+```bash
+hydrogeo-insar list-stages
+```
+
+## Core stages
 
 ```text
 prepare-insar
 prepare-groundwater
 build-groundwater-field
 decompose-insar
-classify-deformation
 joint-harmonics
 estimate-lag
 estimate-ske
 storage-budget
+annual-storage-maps
+```
+
+Optional/legacy stages:
+
+```text
 hydrostratigraphy
 extensometer
-synthesize
-```
-
-Run to one stage:
-
-```bash
-hydrogeo-insar run configs/example_project.yaml --to estimate-ske
-```
-
-Continue from one stage:
-
-```bash
-hydrogeo-insar run configs/example_project.yaml --from storage-budget
+classify-deformation
+estimate-ske-regularized
+synthesize-legacy
 ```
 
 ## Main outputs
 
 ```text
-outputs/groundwater/groundwater_field.h5
-outputs/groundwater/groundwater_model_cv.csv
-outputs/regimes/deformation_regime_id.tif
-outputs/seasonal/phase_lag_days.tif
-outputs/seasonal/ske_effective.tif
-outputs/seasonal/ske_data_support_mask.tif
-outputs/seasonal/ske_support_mask.tif
-outputs/seasonal/ske_model_cv.csv
-outputs/storage/storage_annual_change.csv
-outputs/storage/total_gws_change_equivalent_mm.tif
-outputs/storage/recoverable_gws_change_equivalent_mm.tif
-outputs/storage/irreversible_gws_change_equivalent_mm.tif
-outputs/storage/head_lowfreq_change_m.tif
+outputs/seasonal/
+  lag_summary.json
+  phase_lag_days.tif
+  seasonal_vector_cosine.tif
+  ske_pixelwise_raw_ratio.tif
+  ske_pixelwise.tif
+  ske_pixelwise_support_mask.tif
+  ske_pixelwise_high_confidence.tif
+  ske_pixelwise_high_confidence_mask.tif
+  ske_pixelwise_summary.json
+
+outputs/storage/
+  storage_domain_mask.tif
+  total_gws_change_equivalent_mm.tif
+  recoverable_gws_change_equivalent_mm.tif
+  irreversible_gws_change_equivalent_mm.tif
+  negative_irreversible_change_magnitude_mm.tif
+  head_lowfreq_change_m.tif
+  storage_cumulative_observed.csv
+  storage_annual_change.csv
+  annual_maps_summary.csv
+  annual_maps/
+    YYYY_total_change_mm.tif
+    YYYY_recoverable_change_mm.tif
+    YYYY_irreversible_change_mm.tif
+    YYYY_head_lowfreq_change_m.tif
+    YYYY_recovery_with_continued_compaction.tif
 ```
 
-The code intentionally avoids release hashes, fixed expected scientific values and large audit/gate systems. Only checks needed to preserve data semantics and mathematical validity are retained.
+## Performance
+
+Large least-squares stages group pixels by identical temporal-validity masks. A pseudoinverse is solved once for each unique mask rather than independently for every pixel. Long-running stages print progress and ETA.
+
+## Interpretation
+
+`Ske` is an effective skeletal storage coefficient inferred from the annual groundwater/deformation response. The storage partition is an equivalent hydromechanical decomposition; it is not direct pumping volume. Residual deformation should not be interpreted as proven permanent storage loss without independent hydrostratigraphic or extensometer support.
+
+Generated `outputs*` directories and local raw data are not part of the source release.

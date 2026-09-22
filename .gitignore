@@ -1,5 +1,26 @@
+# Python
 __pycache__/
 *.py[cod]
-.pytest_cache/
 *.egg-info/
-outputs/
+.pytest_cache/
+.venv/
+venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local/generated data
+/outputs*/
+/data/
+/logs/
+/release_backup_*/
+*.log
+
+# Local development backups and machine-specific study configuration
+*.bak*
+*.before-*
+*.v031-backup
+/configs/hengshui_server.yaml
+/configs/hengshui_server.yaml.*
