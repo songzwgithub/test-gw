@@ -10,7 +10,7 @@ from .extensometer.analysis import analyze_extensometer
 from .groundwater.field import build_groundwater_field
 from .hydromechanics.lag import estimate_lag
 from .hydromechanics.pixelwise_storativity import estimate_pixelwise_ske
-from .hydromechanics.seasonal_fast import compute_joint_harmonics
+from .hydromechanics.seasonal import compute_joint_harmonics
 from .hydromechanics.storativity import estimate_regularized_ske
 from .hydrostratigraphy.analysis import analyze_hydrostratigraphy
 from .io.groundwater import prepare_groundwater

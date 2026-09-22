@@ -1,22 +1,18 @@
 project:
   name: example_project
   root: ..
-
 outputs: outputs
-
 analysis:
   start_date: 2018-01-01
   end_date: 2025-12-31
-
 insar:
   path: data/raw/insar
-  pattern: "geo_*.tif"
-  filename_regex: "geo_(\\d{8})_(\\d{8})\\.tif$"
+  pattern: geo_*.tif
+  filename_regex: geo_(\d{8})_(\d{8})\.tif$
   unit: mm
   quantity: vertical_displacement
   positive: uplift
   block_size: 256
-
 groundwater:
   path: data/raw/groundwater.xlsx
   format: wide
@@ -33,26 +29,36 @@ groundwater:
     confined: confined
     unconfined: unconfined
   minimum_water_depth_m: -0.5
-
 groundwater_field:
   aquifer: confined
   max_gap_days: 7
-  min_coverage_fraction: 0.50
-  min_active_well_fraction: 0.50
+  min_coverage_fraction: 0.5
+  min_active_well_fraction: 0.5
   max_temporal_interpolation_gap_days: 60
   min_baseline_observations: 6
-  coordinate_tolerance_deg: 0.00001
+  coordinate_tolerance_deg: 1.0e-05
   svd_iterations: 20
   projected_crs: null
   grid_block_size: 256
   baseline:
     start: 2018-01-01
     end: 2018-12-31
-  rank_candidates: [3, 4, 5, 6]
+  rank_candidates:
+  - 3
+  - 4
+  - 5
+  - 6
   rbf:
     max_centers: 32
-    sigma_km_candidates: [15, 25, 35, 50]
-    ridge_candidates: [0.0001, 0.001, 0.01]
+    sigma_km_candidates:
+    - 15
+    - 25
+    - 35
+    - 50
+    ridge_candidates:
+    - 0.0001
+    - 0.001
+    - 0.01
   cross_validation:
     folds: 5
     block_km: 30
@@ -62,14 +68,12 @@ groundwater_field:
     rmse_shortlist_fraction: 0.05
   support:
     max_nearest_well_km: null
-
 deformation:
   polynomial_degree: 2
   annual_period_days: 365.2425
   min_observations: 24
   vertex_min_abs_curvature: 0.0001
   block_size: 256
-
 seasonal_response:
   annual_period_days: 365.2425
   min_observations: 24
@@ -77,44 +81,50 @@ seasonal_response:
   report_every_blocks: 5
   deformation_polynomial_degree: 2
   groundwater_polynomial_degree: auto
-  groundwater_polynomial_candidates: [1, 2]
+  groundwater_polynomial_candidates:
+  - 1
+  - 2
   groundwater_model_selection: f_test
   groundwater_f_test_alpha: 0.05
   model_selection_sample_size: 3000
   min_head_amplitude_m: 0.2
   min_deformation_amplitude_mm: 0.5
-  lag_search_days: [0, 180]
+  lag_search_days:
+  - 0
+  - 180
   lag_step_days: 0.5
   lag_sample_size: 200000
   random_state: 20260919
-
 ske:
   min: 0.0
   max: 0.05
   min_vector_cosine: 0.0
   high_confidence_min_vector_cosine: 0.7
-
 storage:
   partition_model: jiang2018
   ske_product: pixelwise
   annual_period_days: 365.2425
   baseline_date: 2018-01-01
   end_date: null
-  valid_fraction: 0.90
+  valid_fraction: 0.9
   min_observations: 24
   block_size: 256
   annual_map_block_size: 512
   diagnostic_threshold_mm: 1.0
-
+  export_annual_maps: true
+  ske_cosine_sensitivity:
+  - 0.0
+  - 0.5
+  - 0.7
+  annual_map_verify_block_size: 512
 hydrostratigraphy:
   enabled: false
   layers: []
-
+  ske_product: pixelwise
 extensometer:
   enabled: false
   path: data/raw/extensometer.csv
   measurement_type: interval_compaction
-
 visualization:
   dpi: 180
   max_display_pixels: 1400

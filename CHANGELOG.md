@@ -1,3 +1,15 @@
+# v0.4.1
+
+- made pixelwise Ske the default hydrostratigraphic analysis product;
+- merged the streaming joint-harmonic implementation into `seasonal.py`;
+- applied the global analysis interval consistently to joint harmonics and storage;
+- generated annual storage maps during the storage-budget fitting pass;
+- changed `annual-storage-maps` to raster reintegration verification without temporal refitting;
+- added storage sensitivity for seasonal-vector-cosine thresholds;
+- extended the synthetic integration test through annual-map verification;
+- updated validation documentation and visualization stage naming;
+- added GitHub Actions testing for Python 3.10-3.12.
+
 # v0.4.0
 
 - changed the primary `estimate-ske` result from spatially regularized RBF `Ske` to pixelwise lag-aligned harmonic-vector least squares;

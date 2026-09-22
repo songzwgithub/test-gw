@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hydrogeo-insar"
-version = "0.4.0"
+version = "0.4.1"
 description = "Pixelwise hydrogeodetic analysis from corrected cumulative InSAR and groundwater observations"
 requires-python = ">=3.10"
 dependencies = [

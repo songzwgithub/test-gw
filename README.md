@@ -116,6 +116,7 @@ outputs/storage/
   head_lowfreq_change_m.tif
   storage_cumulative_observed.csv
   storage_annual_change.csv
+  storage_ske_cosine_sensitivity.csv
   annual_maps_summary.csv
   annual_maps/
     YYYY_total_change_mm.tif
@@ -127,7 +128,7 @@ outputs/storage/
 
 ## Performance
 
-Large least-squares stages group pixels by identical temporal-validity masks. A pseudoinverse is solved once for each unique mask rather than independently for every pixel. Long-running stages print progress and ETA.
+Large least-squares stages group pixels by identical temporal-validity masks. A pseudoinverse is solved once for each unique mask rather than independently for every pixel. `storage-budget` writes whole-interval and annual pixelwise maps in one fitting pass; `annual-storage-maps` independently reintegrates the saved rasters for consistency checking and does not refit the temporal model. Long-running stages print progress and ETA.
 
 ## Interpretation
 

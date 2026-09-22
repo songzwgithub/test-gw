@@ -336,7 +336,7 @@ PLOT_STAGES: dict[str, Callable[[ProjectConfig], list[str]]] = {
     "storage-budget": _plot_storage,
     "hydrostratigraphy": _plot_hydrostratigraphy,
     "extensometer": _plot_extensometer,
-    "synthesize": _plot_synthesis,
+    "synthesize-legacy": _plot_synthesis,
 }
 
 
