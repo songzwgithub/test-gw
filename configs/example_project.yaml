@@ -109,7 +109,6 @@ storage:
   valid_fraction: 0.9
   min_observations: 24
   block_size: 256
-  annual_map_block_size: 512
   diagnostic_threshold_mm: 1.0
   export_annual_maps: true
   ske_cosine_sensitivity:

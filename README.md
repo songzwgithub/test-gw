@@ -1,5 +1,4 @@
-# hydrogeo-insar v0.4.0
-
+# hydrogeo-insar v0.4.1
 `hydrogeo-insar` is a reproducible hydrogeodetic workflow for combining corrected cumulative InSAR time series with groundwater observations. The v0.4 publication workflow makes **pixelwise** `Ske` and pixelwise storage partition the primary scientific products.
 
 ## Publication workflow
