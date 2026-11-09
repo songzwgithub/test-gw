@@ -9,6 +9,10 @@ import h5py
 import numpy as np
 import pandas as pd
 import rasterio
+from pyproj import Transformer
+from rasterio.transform import xy as raster_xy
+from scipy.spatial import Delaunay
+from scipy.spatial.distance import cdist
 
 from ..common import (
     block_slices,
@@ -22,6 +26,7 @@ from ..common import (
 from ..config import ProjectConfig
 
 YEAR_DAYS = 365.2425
+NODATA_CLASS = np.uint8(255)
 
 DEFORMATION_CLASSES = {
     0: "complex_or_uncertain",
@@ -32,13 +37,21 @@ DEFORMATION_CLASSES = {
     5: "subsidence_to_rebound",
 }
 
+GROUNDWATER_STATES = {
+    0: "uncertain_or_transition",
+    1: "head_decline",
+    2: "quasi_stable",
+    3: "head_recovery",
+}
+
 COUPLED_CLASSES = {
     0: "complex_or_uncertain",
-    1: "active_depletion_compaction",
+    1: "persistent_head_decline_with_subsidence",
     2: "recovery_responsive",
-    3: "recovery_with_persistent_compaction",
-    4: "recovery_with_accelerating_compaction",
-    5: "quasi_stable",
+    3: "post_recovery_persistent_subsidence",
+    4: "post_recovery_reaccelerating_subsidence",
+    5: "renewed_head_decline_with_reaccelerating_subsidence",
+    6: "quasi_stable",
 }
 
 
@@ -109,9 +122,7 @@ def build_same_season_pairs(
                 "i2": int(j),
                 "date1": str(d1.date()),
                 "date2": str(d2.date()),
-                "anniversary_offset_days": int(
-                    (d2 - target).days
-                ),
+                "anniversary_offset_days": int((d2 - target).days),
                 "elapsed_days": elapsed_days,
                 "elapsed_years": elapsed_days / YEAR_DAYS,
             }
@@ -176,14 +187,19 @@ def _open_float_writer(path: Path, grid: dict[str, Any]):
     return rasterio.open(path, "w", **profile)
 
 
-def _open_uint_writer(path: Path, grid: dict[str, Any], dtype: str = "uint8"):
+def _open_uint_writer(
+    path: Path,
+    grid: dict[str, Any],
+    dtype: str = "uint8",
+    nodata: int = 255,
+):
     profile = geotiff_profile(
         grid["height"],
         grid["width"],
         grid["crs"],
         grid["transform"],
         dtype=dtype,
-        nodata=0,
+        nodata=nodata,
     )
     return rasterio.open(path, "w", **profile)
 
@@ -234,16 +250,24 @@ def _write_same_season_maps(
     grid: dict[str, Any],
     block_size: int,
     min_valid_pairs: int,
+    reuse_existing: bool = False,
 ) -> dict[str, Path]:
     ensure_dir(output_dir)
-    needed, plan = _pair_index_plan(pair_map)
-    if len(needed) == 0:
-        raise ValueError(f"No usable same-season pairs for {prefix}")
-
     paths = {
         label: output_dir / f"{prefix}_{label}_{suffix}.tif"
         for label in pair_map
     }
+    if reuse_existing and paths and all(path.exists() for path in paths.values()):
+        print(
+            f"[EVOLUTION-{prefix.upper()}] reuse {len(paths)} existing interval maps",
+            flush=True,
+        )
+        return paths
+
+    needed, plan = _pair_index_plan(pair_map)
+    if len(needed) == 0:
+        raise ValueError(f"No usable same-season pairs for {prefix}")
+
     writers = {
         label: _open_float_writer(path, grid)
         for label, path in paths.items()
@@ -263,12 +287,7 @@ def _write_same_season_maps(
             report_every = max(1, total // 40)
             for ib, (r0, r1, c0, c1) in enumerate(blocks, start=1):
                 arr = ds[needed, r0:r1, c0:c1].astype(float)
-                window = rasterio.windows.Window(
-                    c0,
-                    r0,
-                    c1 - c0,
-                    r1 - r0,
-                )
+                window = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
                 for label, (i1, i2, years) in plan.items():
                     med = _same_season_median(
                         arr,
@@ -277,11 +296,7 @@ def _write_same_season_maps(
                         years,
                         min_valid_pairs=min_valid_pairs,
                     )
-                    writers[label].write(
-                        med.astype("float32"),
-                        1,
-                        window=window,
-                    )
+                    writers[label].write(med.astype("float32"), 1, window=window)
                 if ib == 1 or ib % report_every == 0 or ib == total:
                     print(
                         f"[EVOLUTION-{prefix.upper()}] {ib}/{total} "
@@ -351,42 +366,106 @@ def classify_deformation_arrays(
     return out
 
 
-def classify_coupled_arrays(
-    head_late_change: np.ndarray,
-    deformation_mode: np.ndarray,
-    deformation_late_rate: np.ndarray,
+def classify_groundwater_state_array(
+    head_change_m_yr: np.ndarray,
     stable_head_change_m_yr: float,
     meaningful_head_change_m_yr: float,
-    stable_rate_mm_yr: float,
 ) -> np.ndarray:
-    head = np.asarray(head_late_change, dtype=float)
-    dmode = np.asarray(deformation_mode, dtype="uint8")
-    late = np.asarray(deformation_late_rate, dtype=float)
+    head = np.asarray(head_change_m_yr, dtype=float)
     out = np.zeros(head.shape, dtype="uint8")
-    valid = np.isfinite(head) & np.isfinite(late) & (dmode > 0)
+    valid = np.isfinite(head)
     sh = float(stable_head_change_m_yr)
     mh = float(meaningful_head_change_m_yr)
     if mh < sh:
         raise ValueError("meaningful_head_change_m_yr must be >= stable_head_change_m_yr")
-    sr = float(stable_rate_mm_yr)
+    out[valid & (head < -mh)] = 1
+    out[valid & (np.abs(head) <= sh)] = 2
+    out[valid & (head > mh)] = 3
+    return out
 
-    depletion = valid & (head < -mh) & (late < -sr)
-    recovery_accel = valid & (head > mh) & (dmode == 3)
-    recovery_responsive = valid & (head > mh) & np.isin(dmode, [4, 5])
-    recovery_persistent = (
-        valid
-        & (head > mh)
-        & (late < -sr)
-        & ~recovery_accel
-        & ~recovery_responsive
+
+def classify_trajectory_arrays(
+    prior_recovery_head_change: np.ndarray,
+    recent_head_change: np.ndarray,
+    recent_decline_count: np.ndarray,
+    deformation_mode: np.ndarray,
+    deformation_late_rate: np.ndarray,
+    deformation_recent_rate_change: np.ndarray,
+    stable_head_change_m_yr: float,
+    meaningful_head_change_m_yr: float,
+    stable_rate_mm_yr: float,
+    meaningful_rate_change_mm_yr: float,
+    recent_decline_min_intervals: int,
+) -> np.ndarray:
+    """Classify coupled trajectories without using inferred storage parameters."""
+    recovery = np.asarray(prior_recovery_head_change, dtype=float)
+    recent_head = np.asarray(recent_head_change, dtype=float)
+    decline_count = np.asarray(recent_decline_count, dtype=float)
+    dmode = np.asarray(deformation_mode, dtype="uint8")
+    late = np.asarray(deformation_late_rate, dtype=float)
+    recent_change = np.asarray(deformation_recent_rate_change, dtype=float)
+
+    out = np.zeros(recovery.shape, dtype="uint8")
+    valid = (
+        np.isfinite(recovery)
+        & np.isfinite(recent_head)
+        & np.isfinite(decline_count)
+        & np.isfinite(late)
+        & np.isfinite(recent_change)
     )
-    quasi_stable = valid & (np.abs(head) <= sh) & (np.abs(late) <= sr)
+    sh = float(stable_head_change_m_yr)
+    mh = float(meaningful_head_change_m_yr)
+    sr = float(stable_rate_mm_yr)
+    dc = float(meaningful_rate_change_mm_yr)
 
-    out[depletion] = 1
+    prior_recovery = valid & (recovery > mh)
+    recent_decline = valid & (decline_count >= int(recent_decline_min_intervals))
+    subsiding = valid & (late < -sr)
+    recent_reacceleration = valid & (recent_change <= -dc)
+    deformation_responsive = valid & np.isin(dmode, [4, 5])
+    quasi_stable = valid & (np.abs(recent_head) <= sh) & (np.abs(late) <= sr)
+
+    persistent_depletion = (
+        valid
+        & ~prior_recovery
+        & recent_decline
+        & subsiding
+        & ~quasi_stable
+    )
+    renewed_decline_reaccel = (
+        prior_recovery
+        & recent_decline
+        & subsiding
+        & recent_reacceleration
+        & ~quasi_stable
+    )
+    post_recovery_reaccel = (
+        prior_recovery
+        & ~recent_decline
+        & subsiding
+        & recent_reacceleration
+        & ~quasi_stable
+    )
+    recovery_responsive = (
+        prior_recovery
+        & deformation_responsive
+        & ~recent_reacceleration
+        & ~quasi_stable
+    )
+    post_recovery_persistent = (
+        prior_recovery
+        & subsiding
+        & ~recent_reacceleration
+        & ~recovery_responsive
+        & ~quasi_stable
+    )
+
+    out[persistent_depletion] = 1
     out[recovery_responsive] = 2
-    out[recovery_persistent] = 3
-    out[recovery_accel] = 4
-    out[quasi_stable] = 5
+    out[post_recovery_persistent] = 3
+    out[post_recovery_reaccel] = 4
+    out[renewed_decline_reaccel] = 5
+    out[quasi_stable] = 6
     return out
 
 
@@ -433,22 +512,22 @@ def _read_interval_block(
     )
 
 
-def _write_well_same_season_table(
+def _build_well_same_season_table(
     cfg: ProjectConfig,
     interval_pairs: list[tuple[int, int]],
     start_month: int,
     end_month: int,
     max_day_diff: int,
     min_pairs: int,
-    out_path: Path,
-) -> None:
+) -> pd.DataFrame:
     path = cfg.outputs / "canonical" / "groundwater.csv"
     if not path.exists():
-        return
+        raise FileNotFoundError(f"Missing canonical groundwater table: {path}")
     frame = pd.read_csv(path, parse_dates=["date"])
     aquifer = str(cfg.section("groundwater_field").get("aquifer", "confined"))
     if "aquifer_class" in frame.columns:
         frame = frame[frame["aquifer_class"].astype(str) == aquifer]
+
     rows: list[dict[str, Any]] = []
     for sid, group in frame.groupby("station_id", sort=True):
         g = group.dropna(subset=["head_m"]).copy()
@@ -497,16 +576,452 @@ def _write_well_same_season_table(
                     "head_change_m_yr": float(np.nanmedian(values)),
                 }
             )
-    pd.DataFrame(rows).to_csv(out_path, index=False)
+    return pd.DataFrame(rows)
+
+
+def _auto_utm_epsg(lon: float, lat: float) -> str:
+    zone = int((lon + 180.0) // 6.0) + 1
+    return f"EPSG:{32600 + zone if lat >= 0 else 32700 + zone}"
+
+
+def _farthest_centers(points: np.ndarray, n: int) -> np.ndarray:
+    n = min(max(1, int(n)), len(points))
+    selected = [int(np.argmin(points[:, 0] + points[:, 1]))]
+    min_dist = cdist(points, points[selected]).ravel()
+    while len(selected) < n:
+        j = int(np.argmax(min_dist))
+        selected.append(j)
+        min_dist = np.minimum(min_dist, cdist(points, points[[j]]).ravel())
+    return points[selected]
+
+
+def _rbf(points: np.ndarray, centers: np.ndarray, sigma_m: float) -> np.ndarray:
+    return np.exp(-0.5 * (cdist(points, centers) / float(sigma_m)) ** 2)
+
+
+def _fit_rbf_scalar(
+    train_xy: np.ndarray,
+    values: np.ndarray,
+    sigma_m: float,
+    ridge: float,
+    max_centers: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    centers = _farthest_centers(train_xy, min(max_centers, len(train_xy)))
+    basis = np.column_stack([np.ones(len(train_xy)), _rbf(train_xy, centers, sigma_m)])
+    penalty = float(ridge) * np.eye(basis.shape[1])
+    penalty[0, 0] = 0.0
+    lhs = basis.T @ basis + penalty
+    rhs = basis.T @ np.asarray(values, dtype=float)
+    try:
+        coef = np.linalg.solve(lhs, rhs)
+    except np.linalg.LinAlgError:
+        coef = np.linalg.lstsq(lhs, rhs, rcond=None)[0]
+    return centers, coef
+
+
+def _predict_rbf_scalar(
+    query_xy: np.ndarray,
+    centers: np.ndarray,
+    sigma_m: float,
+    coef: np.ndarray,
+) -> np.ndarray:
+    basis = np.column_stack([np.ones(len(query_xy)), _rbf(query_xy, centers, sigma_m)])
+    return basis @ coef
+
+
+def _spatial_fold_ids(
+    xy: np.ndarray,
+    n_folds: int,
+    block_km: float,
+    random_state: int,
+) -> np.ndarray:
+    n_folds = min(max(2, int(n_folds)), len(xy))
+    block_m = float(block_km) * 1000.0
+    bx = np.floor((xy[:, 0] - xy[:, 0].min()) / block_m).astype(int)
+    by = np.floor((xy[:, 1] - xy[:, 1].min()) / block_m).astype(int)
+    pairs = np.column_stack([bx, by])
+    _, block_id = np.unique(pairs, axis=0, return_inverse=True)
+    unique = np.unique(block_id)
+    if len(unique) < 2:
+        return np.arange(len(xy), dtype=int) % n_folds
+    rng = np.random.default_rng(random_state)
+    rng.shuffle(unique)
+    mapping = {int(b): i % n_folds for i, b in enumerate(unique)}
+    folds = np.asarray([mapping[int(b)] for b in block_id], dtype=int)
+    if len(np.unique(folds)) < 2:
+        folds = np.arange(len(xy), dtype=int) % n_folds
+    return folds
+
+
+def _project_well_changes(
+    frame: pd.DataFrame,
+    projected_crs: str | None,
+) -> tuple[pd.DataFrame, str]:
+    out = frame.copy()
+    if projected_crs is None:
+        projected_crs = _auto_utm_epsg(float(out["lon"].mean()), float(out["lat"].mean()))
+    tr = Transformer.from_crs("EPSG:4326", projected_crs, always_xy=True)
+    x, y = tr.transform(out["lon"].to_numpy(float), out["lat"].to_numpy(float))
+    out["x"] = np.asarray(x, dtype=float)
+    out["y"] = np.asarray(y, dtype=float)
+    return out, str(projected_crs)
+
+
+def _groundwater_interpolation_settings(cfg: ProjectConfig) -> dict[str, Any]:
+    sec = cfg.section("evolution")
+    override = sec.get("groundwater_interpolation", {})
+    field = cfg.section("groundwater_field")
+    rbf = field.get("rbf", {})
+    cv = field.get("cross_validation", {})
+    return {
+        "max_centers": int(override.get("max_centers", rbf.get("max_centers", 32))),
+        "sigma_km_candidates": [
+            float(v)
+            for v in override.get(
+                "sigma_km_candidates",
+                rbf.get("sigma_km_candidates", [10.0, 15.0, 20.0, 25.0]),
+            )
+        ],
+        "ridge_candidates": [
+            float(v)
+            for v in override.get(
+                "ridge_candidates",
+                rbf.get("ridge_candidates", [0.1, 0.3, 0.6, 1.0]),
+            )
+        ],
+        "folds": int(override.get("folds", cv.get("folds", 5))),
+        "block_km": float(override.get("block_km", cv.get("block_km", 30.0))),
+        "random_state": int(
+            override.get("random_state", cv.get("random_state", 20260919))
+        ),
+        "min_wells_per_interval": int(override.get("min_wells_per_interval", 8)),
+        "max_nearest_well_km": override.get("max_nearest_well_km"),
+    }
+
+
+def _select_groundwater_change_model(
+    frame: pd.DataFrame,
+    labels: list[str],
+    settings: dict[str, Any],
+    stable_head: float,
+    meaningful_head: float,
+) -> tuple[dict[str, Any], pd.DataFrame]:
+    rows: list[dict[str, Any]] = []
+    min_wells = int(settings["min_wells_per_interval"])
+    for sigma_km in settings["sigma_km_candidates"]:
+        for ridge in settings["ridge_candidates"]:
+            actual_all: list[np.ndarray] = []
+            predicted_all: list[np.ndarray] = []
+            n_interval = 0
+            for label in labels:
+                y1, y2 = map(int, label.split("_"))
+                g = frame[(frame["year1"] == y1) & (frame["year2"] == y2)].copy()
+                g = g[np.isfinite(g["head_change_m_yr"])].reset_index(drop=True)
+                if len(g) < min_wells:
+                    continue
+                xy = g[["x", "y"]].to_numpy(float)
+                values = g["head_change_m_yr"].to_numpy(float)
+                folds = _spatial_fold_ids(
+                    xy,
+                    n_folds=min(int(settings["folds"]), len(g)),
+                    block_km=float(settings["block_km"]),
+                    random_state=int(settings["random_state"]),
+                )
+                used = False
+                for fold in np.unique(folds):
+                    test = folds == fold
+                    train = ~test
+                    if int(train.sum()) < 4 or int(test.sum()) == 0:
+                        continue
+                    centers, coef = _fit_rbf_scalar(
+                        xy[train],
+                        values[train],
+                        float(sigma_km) * 1000.0,
+                        float(ridge),
+                        int(settings["max_centers"]),
+                    )
+                    pred = _predict_rbf_scalar(
+                        xy[test], centers, float(sigma_km) * 1000.0, coef
+                    )
+                    actual_all.append(values[test])
+                    predicted_all.append(pred)
+                    used = True
+                if used:
+                    n_interval += 1
+
+            if not actual_all:
+                continue
+            actual = np.concatenate(actual_all)
+            predicted = np.concatenate(predicted_all)
+            error = predicted - actual
+            true_state = classify_groundwater_state_array(
+                actual, stable_head, meaningful_head
+            )
+            pred_state = classify_groundwater_state_array(
+                predicted, stable_head, meaningful_head
+            )
+            decisive = true_state > 0
+            state_accuracy = (
+                float(np.mean(pred_state[decisive] == true_state[decisive]))
+                if decisive.any()
+                else np.nan
+            )
+            rows.append(
+                {
+                    "sigma_km": float(sigma_km),
+                    "ridge": float(ridge),
+                    "n_intervals": int(n_interval),
+                    "n_validation": int(len(actual)),
+                    "cv_rmse_m_yr": float(np.sqrt(np.mean(error**2))),
+                    "cv_mae_m_yr": float(np.mean(np.abs(error))),
+                    "cv_bias_m_yr": float(np.mean(error)),
+                    "cv_state_accuracy": state_accuracy,
+                }
+            )
+
+    table = pd.DataFrame(rows)
+    if table.empty:
+        raise ValueError("Groundwater-change spatial cross-validation produced no valid candidate")
+    ordered = table.sort_values(
+        ["cv_rmse_m_yr", "cv_state_accuracy", "sigma_km", "ridge"],
+        ascending=[True, False, True, True],
+        na_position="last",
+    ).reset_index(drop=True)
+    best = ordered.iloc[0].to_dict()
+    return best, ordered
+
+
+def _fit_interval_groundwater_models(
+    frame: pd.DataFrame,
+    labels: list[str],
+    best: dict[str, Any],
+    settings: dict[str, Any],
+) -> tuple[dict[str, dict[str, Any]], pd.DataFrame]:
+    models: dict[str, dict[str, Any]] = {}
+    rows: list[dict[str, Any]] = []
+    min_wells = int(settings["min_wells_per_interval"])
+    for label in labels:
+        y1, y2 = map(int, label.split("_"))
+        g = frame[(frame["year1"] == y1) & (frame["year2"] == y2)].copy()
+        g = g[np.isfinite(g["head_change_m_yr"])].reset_index(drop=True)
+        if len(g) < min_wells:
+            continue
+        xy = g[["x", "y"]].to_numpy(float)
+        values = g["head_change_m_yr"].to_numpy(float)
+        centers, coef = _fit_rbf_scalar(
+            xy,
+            values,
+            float(best["sigma_km"]) * 1000.0,
+            float(best["ridge"]),
+            int(settings["max_centers"]),
+        )
+        hull = Delaunay(xy) if len(xy) >= 3 else None
+        models[label] = {
+            "xy": xy,
+            "values": values,
+            "centers": centers,
+            "coef": coef,
+            "hull": hull,
+        }
+        rows.append(
+            {
+                "year1": y1,
+                "year2": y2,
+                "n_wells": int(len(g)),
+                "well_median_m_yr": float(np.nanmedian(values)),
+                "well_mean_m_yr": float(np.nanmean(values)),
+                "well_p10_m_yr": float(np.nanpercentile(values, 10)),
+                "well_p90_m_yr": float(np.nanpercentile(values, 90)),
+            }
+        )
+    return models, pd.DataFrame(rows)
+
+
+def _write_groundwater_change_maps(
+    cfg: ProjectConfig,
+    frame: pd.DataFrame,
+    labels: list[str],
+    grid: dict[str, Any],
+    out_dir: Path,
+    stable_head: float,
+    meaningful_head: float,
+    block_size: int,
+    support_path: Path | None,
+) -> tuple[dict[str, Path], dict[str, Path], dict[str, Any]]:
+    settings = _groundwater_interpolation_settings(cfg)
+    projected_cfg = cfg.section("groundwater_field").get("projected_crs")
+    projected, projected_crs = _project_well_changes(frame, projected_cfg)
+
+    best, cv_table = _select_groundwater_change_model(
+        projected,
+        labels,
+        settings,
+        stable_head,
+        meaningful_head,
+    )
+    cv_table.to_csv(out_dir.parent / "groundwater_change_spatial_cv.csv", index=False)
+
+    models, interval_summary = _fit_interval_groundwater_models(
+        projected,
+        labels,
+        best,
+        settings,
+    )
+    missing = sorted(set(labels) - set(models))
+    if missing:
+        raise ValueError(f"Too few wells for groundwater-change intervals: {missing}")
+    interval_summary.to_csv(
+        out_dir.parent / "groundwater_change_interval_summary.csv", index=False
+    )
+
+    paths = {
+        label: out_dir / f"head_change_{label}_m_yr.tif"
+        for label in labels
+    }
+    state_paths = {
+        label: out_dir / f"groundwater_state_{label}.tif"
+        for label in labels
+    }
+    writers = {label: _open_float_writer(path, grid) for label, path in paths.items()}
+    state_writers = {
+        label: _open_uint_writer(path, grid, nodata=int(NODATA_CLASS))
+        for label, path in state_paths.items()
+    }
+
+    support_src = rasterio.open(support_path) if support_path is not None else None
+    grid_to_model = Transformer.from_crs(grid["crs"], projected_crs, always_xy=True)
+    max_nearest_km = settings.get("max_nearest_well_km")
+    max_nearest_m = None if max_nearest_km is None else float(max_nearest_km) * 1000.0
+
+    blocks = list(block_slices(grid["height"], grid["width"], int(block_size)))
+    total = len(blocks)
+    report_every = max(1, total // 40)
+
+    try:
+        for ib, (r0, r1, c0, c1) in enumerate(blocks, start=1):
+            window = rasterio.windows.Window(c0, r0, c1 - c0, r1 - r0)
+            shape = (r1 - r0, c1 - c0)
+            rr, cc = np.meshgrid(
+                np.arange(r0, r1), np.arange(c0, c1), indexing="ij"
+            )
+            xs, ys = raster_xy(
+                grid["transform"], rr.ravel(), cc.ravel(), offset="center"
+            )
+            mx, my = grid_to_model.transform(np.asarray(xs), np.asarray(ys))
+            qxy = np.column_stack([mx, my])
+            base_support = _read_support_block(support_src, window, shape).ravel()
+
+            for label in labels:
+                model = models[label]
+                valid = base_support.copy()
+                hull = model["hull"]
+                if hull is not None:
+                    valid &= hull.find_simplex(qxy) >= 0
+                if max_nearest_m is not None and valid.any():
+                    d = cdist(qxy[valid], model["xy"])
+                    nearest = np.min(d, axis=1)
+                    vv = valid.copy()
+                    vv[valid] = nearest <= max_nearest_m
+                    valid = vv
+
+                pred = np.full(len(qxy), np.nan, dtype=float)
+                state = np.full(len(qxy), int(NODATA_CLASS), dtype="uint8")
+                if valid.any():
+                    pred[valid] = _predict_rbf_scalar(
+                        qxy[valid],
+                        model["centers"],
+                        float(best["sigma_km"]) * 1000.0,
+                        model["coef"],
+                    )
+                    state[valid] = classify_groundwater_state_array(
+                        pred[valid], stable_head, meaningful_head
+                    )
+
+                writers[label].write(pred.reshape(shape).astype("float32"), 1, window=window)
+                state_writers[label].write(state.reshape(shape), 1, window=window)
+
+            if ib == 1 or ib % report_every == 0 or ib == total:
+                print(
+                    f"[EVOLUTION-GROUNDWATER] {ib}/{total} "
+                    f"({100.0 * ib / total:5.1f}%)",
+                    flush=True,
+                )
+    finally:
+        if support_src is not None:
+            support_src.close()
+        for dst in writers.values():
+            dst.close()
+        for dst in state_writers.values():
+            dst.close()
+
+    summary = {
+        "method": "direct_well_same_season_change_rbf_spatial_cv",
+        "projected_crs": projected_crs,
+        "sigma_km": float(best["sigma_km"]),
+        "ridge": float(best["ridge"]),
+        "cv_rmse_m_yr": float(best["cv_rmse_m_yr"]),
+        "cv_mae_m_yr": float(best["cv_mae_m_yr"]),
+        "cv_bias_m_yr": float(best["cv_bias_m_yr"]),
+        "cv_state_accuracy": float(best["cv_state_accuracy"]),
+        "max_centers": int(settings["max_centers"]),
+        "min_wells_per_interval": int(settings["min_wells_per_interval"]),
+        "max_nearest_well_km": settings.get("max_nearest_well_km"),
+    }
+    write_json(out_dir.parent / "groundwater_change_interpolation_summary.json", summary)
+    return paths, state_paths, summary
+
+
+def _mode_summary_rows(
+    family: str,
+    labels: dict[int, str],
+    counts: Counter[int],
+    areas: Counter[int],
+    support_count: int,
+    support_area: float,
+) -> list[dict[str, Any]]:
+    classified_count = int(sum(counts[cid] for cid in labels if cid != 0))
+    classified_area = float(sum(areas[cid] for cid in labels if cid != 0))
+    rows: list[dict[str, Any]] = []
+    for cid, label in labels.items():
+        count = int(counts[cid])
+        area = float(areas[cid])
+        rows.append(
+            {
+                "family": family,
+                "class_id": int(cid),
+                "class_label": label,
+                "pixel_count": count,
+                "area_km2": area / 1e6,
+                "support_pixel_count": int(support_count),
+                "support_area_km2": float(support_area) / 1e6,
+                "fraction_of_support_pixels": (
+                    count / support_count if support_count else np.nan
+                ),
+                "fraction_of_support_area": (
+                    area / support_area if support_area else np.nan
+                ),
+                "classified_pixel_count": classified_count,
+                "classified_area_km2": classified_area / 1e6,
+                "classified_fraction_of_support": (
+                    classified_count / support_count if support_count else np.nan
+                ),
+                "fraction_of_classified_pixels": (
+                    count / classified_count
+                    if cid != 0 and classified_count
+                    else np.nan
+                ),
+                "fraction_of_classified_area": (
+                    area / classified_area
+                    if cid != 0 and classified_area
+                    else np.nan
+                ),
+            }
+        )
+    return rows
 
 
 def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
-    """Compute physically interpretable deformation-groundwater evolution modes.
-
-    Classification is intentionally observation-first. It uses only same-season
-    interannual deformation and confined-head changes. Ske, storage partition,
-    and hydrostratigraphy are reserved for independent interpretation.
-    """
+    """Compute observation-first groundwater-deformation evolution trajectories."""
     sec = cfg.section("evolution")
     analysis = cfg.section("analysis")
     start_default = str(analysis.get("start_date", "2018-01-01"))
@@ -521,9 +1036,7 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
     block_size = int(sec.get("block_size", 256))
 
     stable_rate = float(sec.get("stable_rate_mm_yr", 5.0))
-    meaningful_change = float(
-        sec.get("meaningful_rate_change_mm_yr", 5.0)
-    )
+    meaningful_change = float(sec.get("meaningful_rate_change_mm_yr", 5.0))
     stable_head = float(sec.get("stable_head_change_m_yr", 0.5))
     meaningful_head = float(sec.get("meaningful_head_change_m_yr", 1.0))
     if meaningful_head < stable_head:
@@ -533,20 +1046,11 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         )
 
     insar_path = cfg.outputs / "canonical" / "insar_stack.h5"
-    head_path = cfg.outputs / "groundwater" / "groundwater_field.h5"
     if not insar_path.exists():
         raise FileNotFoundError(f"Missing canonical InSAR stack: {insar_path}")
-    if not head_path.exists():
-        raise FileNotFoundError(f"Missing groundwater field: {head_path}")
-
     grid = h5_grid_metadata(insar_path)
-    if h5_grid_metadata(head_path) != grid:
-        raise ValueError("Groundwater field grid does not match canonical InSAR grid")
-
     with h5py.File(insar_path, "r") as h5:
         insar_dates = days_to_dates(h5["date_days"][:])
-    with h5py.File(head_path, "r") as h5:
-        head_dates = days_to_dates(h5["date_days"][:])
 
     d_pairs = _build_pair_map(
         insar_dates,
@@ -557,48 +1061,89 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         max_day_diff,
         min_pairs,
     )
-    h_pairs = _build_pair_map(
-        head_dates,
-        start_year,
-        end_year,
+    if len(d_pairs) < 2:
+        raise ValueError("At least two InSAR annual evolution intervals are required")
+
+    candidate_labels = sorted(d_pairs, key=lambda s: int(s.split("_")[0]))
+    interval_pairs = [tuple(map(int, label.split("_"))) for label in candidate_labels]
+    well_table = _build_well_same_season_table(
+        cfg,
+        interval_pairs,
         start_month,
         end_month,
         max_day_diff,
         min_pairs,
     )
-
-    common_labels = sorted(
-        set(d_pairs) & set(h_pairs),
-        key=lambda s: int(s.split("_")[0]),
-    )
-    if len(common_labels) < 2:
-        raise ValueError("At least two common annual evolution intervals are required")
-
-    n_default = min(3, max(1, len(common_labels) // 2))
-    default_early = [tuple(map(int, x.split("_"))) for x in common_labels[:n_default]]
-    default_late = [tuple(map(int, x.split("_"))) for x in common_labels[-n_default:]]
-    early_pairs = _parse_interval_list(sec.get("early_intervals"), default_early)
-    late_pairs = _parse_interval_list(sec.get("late_intervals"), default_late)
-    early_labels = [_interval_label(*x) for x in early_pairs]
-    late_labels = [_interval_label(*x) for x in late_pairs]
-
-    required = set(early_labels + late_labels)
-    missing_d = sorted(required - set(d_pairs))
-    missing_h = sorted(required - set(h_pairs))
-    if missing_d:
-        raise ValueError(f"Missing required InSAR evolution intervals: {missing_d}")
-    if missing_h:
-        raise ValueError(f"Missing required groundwater evolution intervals: {missing_h}")
-
-    min_valid_intervals = int(
-        sec.get("min_valid_intervals", min(4, len(common_labels)))
-    )
-    min_valid_intervals = max(2, min(min_valid_intervals, len(common_labels)))
+    if well_table.empty:
+        raise ValueError("No valid well-based same-season groundwater changes")
 
     out_dir = ensure_dir(cfg.outputs / "evolution")
     d_dir = ensure_dir(out_dir / "deformation")
     h_dir = ensure_dir(out_dir / "groundwater")
+    well_table.to_csv(out_dir / "well_same_season_head_change.csv", index=False)
 
+    settings = _groundwater_interpolation_settings(cfg)
+    counts = (
+        well_table.groupby(["year1", "year2"])
+        .size()
+        .rename("n")
+        .reset_index()
+    )
+    available_h = {
+        _interval_label(row.year1, row.year2)
+        for row in counts.itertuples()
+        if int(row.n) >= int(settings["min_wells_per_interval"])
+    }
+    common_labels = [label for label in candidate_labels if label in available_h]
+    if len(common_labels) < 2:
+        raise ValueError("At least two common InSAR/well groundwater intervals are required")
+
+    n_default = min(3, max(1, len(common_labels) // 2))
+    default_early = [tuple(map(int, x.split("_"))) for x in common_labels[:n_default]]
+    default_late = [tuple(map(int, x.split("_"))) for x in common_labels[-n_default:]]
+    default_recent_labels = common_labels[-min(3, len(common_labels)):]
+    recent_start = max(0, len(common_labels) - len(default_recent_labels) - 2)
+    recovery_stop = len(common_labels) - len(default_recent_labels)
+    default_recovery_labels = common_labels[recent_start:recovery_stop]
+    if not default_recovery_labels:
+        default_recovery_labels = common_labels[: min(2, len(common_labels))]
+
+    early_pairs = _parse_interval_list(sec.get("early_intervals"), default_early)
+    late_pairs = _parse_interval_list(sec.get("late_intervals"), default_late)
+    recovery_pairs = _parse_interval_list(
+        sec.get("recovery_intervals"),
+        [tuple(map(int, x.split("_"))) for x in default_recovery_labels],
+    )
+    recent_pairs = _parse_interval_list(
+        sec.get("recent_intervals"),
+        [tuple(map(int, x.split("_"))) for x in default_recent_labels],
+    )
+    early_labels = [_interval_label(*x) for x in early_pairs]
+    late_labels = [_interval_label(*x) for x in late_pairs]
+    recovery_labels = [_interval_label(*x) for x in recovery_pairs]
+    recent_labels = [_interval_label(*x) for x in recent_pairs]
+
+    required = set(early_labels + late_labels + recovery_labels + recent_labels)
+    missing = sorted(required - set(common_labels))
+    if missing:
+        raise ValueError(f"Missing required evolution intervals: {missing}")
+
+    min_valid_intervals = int(sec.get("min_valid_intervals", min(4, len(common_labels))))
+    min_valid_intervals = max(2, min(min_valid_intervals, len(common_labels)))
+    min_recent_intervals = int(
+        sec.get("min_recent_intervals", min(2, len(recent_labels)))
+    )
+    min_recent_intervals = max(1, min(min_recent_intervals, len(recent_labels)))
+    min_recovery_intervals = int(sec.get("min_recovery_intervals", 1))
+    min_recovery_intervals = max(1, min(min_recovery_intervals, len(recovery_labels)))
+    recent_decline_min_intervals = int(
+        sec.get("recent_decline_min_intervals", min(2, len(recent_labels)))
+    )
+    recent_decline_min_intervals = max(
+        1, min(recent_decline_min_intervals, len(recent_labels))
+    )
+
+    reuse_deformation = bool(sec.get("reuse_existing_deformation_maps", True))
     d_paths = _write_same_season_maps(
         insar_path,
         "displacement_mm",
@@ -609,17 +1154,24 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         grid,
         block_size,
         min_pairs,
+        reuse_existing=reuse_deformation,
     )
-    h_paths = _write_same_season_maps(
-        head_path,
-        "head_anomaly_m",
-        {k: h_pairs[k] for k in common_labels},
-        h_dir,
-        "head_change",
-        "m_yr",
+
+    support_name = str(sec.get("support_mask", "high_confidence"))
+    support_path = _support_mask_path(cfg, support_name)
+    if support_path is not None and not support_path.exists():
+        raise FileNotFoundError(f"Evolution support mask does not exist: {support_path}")
+
+    h_paths, groundwater_state_paths, groundwater_interp = _write_groundwater_change_maps(
+        cfg,
+        well_table,
+        common_labels,
         grid,
+        h_dir,
+        stable_head,
+        meaningful_head,
         block_size,
-        min_pairs,
+        support_path,
     )
 
     metric_names = [
@@ -627,32 +1179,34 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         "deformation_late_rate_mm_yr",
         "deformation_rate_change_mm_yr",
         "deformation_rate_slope_mm_yr2",
+        "deformation_recent_rate_change_mm_yr",
+        "deformation_recent_rate_slope_mm_yr2",
         "head_early_change_m_yr",
         "head_late_change_m_yr",
         "head_change_difference_m_yr",
         "head_change_slope_m_yr2",
+        "head_recovery_period_change_m_yr",
+        "head_recent_change_m_yr",
     ]
     float_writers = {
         name: _open_float_writer(out_dir / f"{name}.tif", grid)
         for name in metric_names
     }
     def_mode_writer = _open_uint_writer(
-        out_dir / "deformation_evolution_mode.tif", grid
+        out_dir / "deformation_evolution_mode.tif", grid, nodata=int(NODATA_CLASS)
     )
     coupled_writer = _open_uint_writer(
-        out_dir / "coupled_evolution_mode.tif", grid
+        out_dir / "coupled_evolution_mode.tif", grid, nodata=int(NODATA_CLASS)
+    )
+    recent_gw_state_writer = _open_uint_writer(
+        out_dir / "groundwater_recent_state.tif", grid, nodata=int(NODATA_CLASS)
     )
     d_valid_writer = _open_uint_writer(
-        out_dir / "deformation_valid_intervals.tif", grid, dtype="uint8"
+        out_dir / "deformation_valid_intervals.tif", grid, dtype="uint8", nodata=0
     )
     h_valid_writer = _open_uint_writer(
-        out_dir / "head_valid_intervals.tif", grid, dtype="uint8"
+        out_dir / "head_valid_intervals.tif", grid, dtype="uint8", nodata=0
     )
-
-    support_name = str(sec.get("support_mask", "high_confidence"))
-    support_path = _support_mask_path(cfg, support_name)
-    if support_path is not None and not support_path.exists():
-        raise FileNotFoundError(f"Evolution support mask does not exist: {support_path}")
 
     d_readers = {k: rasterio.open(d_paths[k]) for k in common_labels}
     h_readers = {k: rasterio.open(h_paths[k]) for k in common_labels}
@@ -665,21 +1219,42 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         ],
         dtype=float,
     )
-    early_idx = np.asarray([common_labels.index(x) for x in early_labels], dtype=int)
-    late_idx = np.asarray([common_labels.index(x) for x in late_labels], dtype=int)
+    early_idx = np.asarray([common_labels.index(v) for v in early_labels], dtype=int)
+    late_idx = np.asarray([common_labels.index(v) for v in late_labels], dtype=int)
+    recovery_idx = np.asarray([common_labels.index(v) for v in recovery_labels], dtype=int)
+    recent_idx = np.asarray([common_labels.index(v) for v in recent_labels], dtype=int)
+    recent_x = x[recent_idx]
+    recent_span = float(recent_x[-1] - recent_x[0]) if len(recent_x) >= 2 else 1.0
 
     d_counts: Counter[int] = Counter()
     c_counts: Counter[int] = Counter()
-    d_area = Counter()
-    c_area = Counter()
+    d_area: Counter[int] = Counter()
+    c_area: Counter[int] = Counter()
+    cross_counts: Counter[tuple[int, int]] = Counter()
+    cross_area: Counter[tuple[int, int]] = Counter()
+    support_count = 0
+    support_area = 0.0
     area_rows = pixel_area_rows(
         grid["height"], grid["width"], grid["crs"], grid["transform"]
     )
 
     sensitivity_cfg = sec.get("sensitivity", {})
-    sr_options = [float(v) for v in sensitivity_cfg.get("stable_rate_mm_yr", [3.0, 5.0, 10.0])]
-    dc_options = [float(v) for v in sensitivity_cfg.get("meaningful_rate_change_mm_yr", [3.0, 5.0, 10.0])]
-    mh_options = [float(v) for v in sensitivity_cfg.get("meaningful_head_change_m_yr", [0.5, 1.0, 1.5])]
+    sr_options = [
+        float(v)
+        for v in sensitivity_cfg.get("stable_rate_mm_yr", [3.0, 5.0, 10.0])
+    ]
+    dc_options = [
+        float(v)
+        for v in sensitivity_cfg.get(
+            "meaningful_rate_change_mm_yr", [3.0, 5.0, 10.0]
+        )
+    ]
+    mh_options = [
+        float(v)
+        for v in sensitivity_cfg.get(
+            "meaningful_head_change_m_yr", [0.5, 1.0, 1.5]
+        )
+    ]
     mh_options = [v for v in mh_options if v >= stable_head]
     if not mh_options:
         mh_options = [meaningful_head]
@@ -690,6 +1265,7 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         for dc in dc_options
         for mh in mh_options
     }
+    sens_support_counts: Counter[tuple[float, float, float]] = Counter()
 
     blocks = list(block_slices(grid["height"], grid["width"], block_size))
     total_blocks = len(blocks)
@@ -704,20 +1280,52 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
 
             dvalid = np.isfinite(dstack).sum(axis=0)
             hvalid = np.isfinite(hstack).sum(axis=0)
-            enough = (dvalid >= min_valid_intervals) & (hvalid >= min_valid_intervals)
+            recent_dvalid = np.isfinite(dstack[recent_idx]).sum(axis=0)
+            recent_hvalid = np.isfinite(hstack[recent_idx]).sum(axis=0)
+            recovery_hvalid = np.isfinite(hstack[recovery_idx]).sum(axis=0)
+            enough = (
+                (dvalid >= min_valid_intervals)
+                & (hvalid >= min_valid_intervals)
+                & (recent_dvalid >= min_recent_intervals)
+                & (recent_hvalid >= min_recent_intervals)
+                & (recovery_hvalid >= min_recovery_intervals)
+            )
             support = _read_support_block(support_src, window, shape) & enough
 
             d_early = _nanmedian_stack(dstack[early_idx], axis=0)
             d_late = _nanmedian_stack(dstack[late_idx], axis=0)
             d_change = d_late - d_early
             d_slope = _nan_slope(dstack, x, min_valid_intervals)
+            d_recent_slope = _nan_slope(
+                dstack[recent_idx], recent_x, min_recent_intervals
+            )
+            d_recent_change = d_recent_slope * recent_span
 
             h_early = _nanmedian_stack(hstack[early_idx], axis=0)
             h_late = _nanmedian_stack(hstack[late_idx], axis=0)
             h_difference = h_late - h_early
             h_slope = _nan_slope(hstack, x, min_valid_intervals)
+            h_recovery = _nanmedian_stack(hstack[recovery_idx], axis=0)
+            h_recent = _nanmedian_stack(hstack[recent_idx], axis=0)
+            recent_decline_count = np.sum(
+                hstack[recent_idx] < -meaningful_head,
+                axis=0,
+            ).astype(float)
 
-            for arr in [d_early, d_late, d_change, d_slope, h_early, h_late, h_difference, h_slope]:
+            for arr in [
+                d_early,
+                d_late,
+                d_change,
+                d_slope,
+                d_recent_change,
+                d_recent_slope,
+                h_early,
+                h_late,
+                h_difference,
+                h_slope,
+                h_recovery,
+                h_recent,
+            ]:
                 arr[~support] = np.nan
 
             dmode = classify_deformation_arrays(
@@ -727,49 +1335,79 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
                 stable_rate,
                 meaningful_change,
             )
-            cmode = classify_coupled_arrays(
-                h_late,
+            cmode = classify_trajectory_arrays(
+                h_recovery,
+                h_recent,
+                recent_decline_count,
                 dmode,
                 d_late,
+                d_recent_change,
                 stable_head,
                 meaningful_head,
                 stable_rate,
+                meaningful_change,
+                recent_decline_min_intervals,
             )
-            dmode[~support] = 0
-            cmode[~support] = 0
+            recent_gw_state = classify_groundwater_state_array(
+                h_recent, stable_head, meaningful_head
+            )
 
             values = {
                 "deformation_early_rate_mm_yr": d_early,
                 "deformation_late_rate_mm_yr": d_late,
                 "deformation_rate_change_mm_yr": d_change,
                 "deformation_rate_slope_mm_yr2": d_slope,
+                "deformation_recent_rate_change_mm_yr": d_recent_change,
+                "deformation_recent_rate_slope_mm_yr2": d_recent_slope,
                 "head_early_change_m_yr": h_early,
                 "head_late_change_m_yr": h_late,
                 "head_change_difference_m_yr": h_difference,
                 "head_change_slope_m_yr2": h_slope,
+                "head_recovery_period_change_m_yr": h_recovery,
+                "head_recent_change_m_yr": h_recent,
             }
             for name, arr in values.items():
                 float_writers[name].write(arr.astype("float32"), 1, window=window)
-            def_mode_writer.write(dmode, 1, window=window)
-            coupled_writer.write(cmode, 1, window=window)
-            d_valid_writer.write(np.where(support, dvalid, 0).astype("uint8"), 1, window=window)
-            h_valid_writer.write(np.where(support, hvalid, 0).astype("uint8"), 1, window=window)
+
+            dmode_out = np.where(support, dmode, NODATA_CLASS).astype("uint8")
+            cmode_out = np.where(support, cmode, NODATA_CLASS).astype("uint8")
+            gw_state_out = np.where(
+                support, recent_gw_state, NODATA_CLASS
+            ).astype("uint8")
+            def_mode_writer.write(dmode_out, 1, window=window)
+            coupled_writer.write(cmode_out, 1, window=window)
+            recent_gw_state_writer.write(gw_state_out, 1, window=window)
+            d_valid_writer.write(
+                np.where(support, dvalid, 0).astype("uint8"), 1, window=window
+            )
+            h_valid_writer.write(
+                np.where(support, hvalid, 0).astype("uint8"), 1, window=window
+            )
 
             area = area_rows[r0:r1, None]
+            support_count += int(support.sum())
+            support_area += float(np.sum(np.where(support, area, 0.0)))
             for cid in DEFORMATION_CLASSES:
-                if cid == 0:
-                    continue
-                m = dmode == cid
+                m = support & (dmode == cid)
                 d_counts[cid] += int(m.sum())
                 d_area[cid] += float(np.sum(np.where(m, area, 0.0)))
             for cid in COUPLED_CLASSES:
-                if cid == 0:
-                    continue
-                m = cmode == cid
+                m = support & (cmode == cid)
                 c_counts[cid] += int(m.sum())
                 c_area[cid] += float(np.sum(np.where(m, area, 0.0)))
+            for gid in GROUNDWATER_STATES:
+                for did in DEFORMATION_CLASSES:
+                    m = support & (recent_gw_state == gid) & (dmode == did)
+                    if m.any():
+                        cross_counts[(gid, did)] += int(m.sum())
+                        cross_area[(gid, did)] += float(
+                            np.sum(np.where(m, area, 0.0))
+                        )
 
-            ss = (slice(None, None, sensitivity_stride), slice(None, None, sensitivity_stride))
+            ss = (
+                slice(None, None, sensitivity_stride),
+                slice(None, None, sensitivity_stride),
+            )
             sup_s = support[ss]
             if sup_s.any():
                 for sr in sr_options:
@@ -778,13 +1416,27 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
                             d_early[ss], d_late[ss], d_change[ss], sr, dc
                         )
                         for mh in mh_options:
-                            cm = classify_coupled_arrays(
-                                h_late[ss], dm, d_late[ss], stable_head, mh, sr
+                            decline_count_s = np.sum(
+                                hstack[recent_idx][:, ss[0], ss[1]] < -mh,
+                                axis=0,
+                            ).astype(float)
+                            cm = classify_trajectory_arrays(
+                                h_recovery[ss],
+                                h_recent[ss],
+                                decline_count_s,
+                                dm,
+                                d_late[ss],
+                                d_recent_change[ss],
+                                stable_head,
+                                mh,
+                                sr,
+                                dc,
+                                recent_decline_min_intervals,
                             )
-                            cm[~sup_s] = 0
                             key = (sr, dc, mh)
-                            vals, counts = np.unique(cm[cm > 0], return_counts=True)
-                            for cid, count in zip(vals, counts):
+                            sens_support_counts[key] += int(sup_s.sum())
+                            vals, cc = np.unique(cm[sup_s], return_counts=True)
+                            for cid, count in zip(vals, cc):
                                 sens_counts[key][int(cid)] += int(count)
 
             if ib == 1 or ib % report_every == 0 or ib == total_blocks:
@@ -804,35 +1456,26 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
             dst.close()
         def_mode_writer.close()
         coupled_writer.close()
+        recent_gw_state_writer.close()
         d_valid_writer.close()
         h_valid_writer.close()
 
-    summary_rows: list[dict[str, Any]] = []
-    for family, labels, counts, areas in [
-        ("deformation", DEFORMATION_CLASSES, d_counts, d_area),
-        ("coupled", COUPLED_CLASSES, c_counts, c_area),
-    ]:
-        total_area = float(sum(areas.values()))
-        total_count = int(sum(counts.values()))
-        for cid, label in labels.items():
-            if cid == 0:
-                continue
-            area_km2 = float(areas[cid]) / 1e6
-            summary_rows.append(
-                {
-                    "family": family,
-                    "class_id": int(cid),
-                    "class_label": label,
-                    "pixel_count": int(counts[cid]),
-                    "area_km2": area_km2,
-                    "fraction_of_classified_pixels": (
-                        float(counts[cid]) / total_count if total_count else np.nan
-                    ),
-                    "fraction_of_classified_area": (
-                        float(areas[cid]) / total_area if total_area else np.nan
-                    ),
-                }
-            )
+    summary_rows = _mode_summary_rows(
+        "deformation",
+        DEFORMATION_CLASSES,
+        d_counts,
+        d_area,
+        support_count,
+        support_area,
+    )
+    summary_rows += _mode_summary_rows(
+        "coupled",
+        COUPLED_CLASSES,
+        c_counts,
+        c_area,
+        support_count,
+        support_area,
+    )
     pd.DataFrame(summary_rows).to_csv(
         out_dir / "evolution_mode_summary.csv", index=False
     )
@@ -841,17 +1484,28 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         {"family": "deformation", "class_id": k, "class_label": v}
         for k, v in DEFORMATION_CLASSES.items()
     ] + [
+        {"family": "groundwater", "class_id": k, "class_label": v}
+        for k, v in GROUNDWATER_STATES.items()
+    ] + [
         {"family": "coupled", "class_id": k, "class_label": v}
         for k, v in COUPLED_CLASSES.items()
+    ] + [
+        {
+            "family": "all",
+            "class_id": int(NODATA_CLASS),
+            "class_label": "outside_support_or_nodata",
+        }
     ]
     pd.DataFrame(legend_rows).to_csv(out_dir / "evolution_mode_legend.csv", index=False)
 
     sens_rows: list[dict[str, Any]] = []
-    for (sr, dc, mh), counts in sens_counts.items():
-        total = int(sum(counts.values()))
+    for (sr, dc, mh), counts_i in sens_counts.items():
+        support_n = int(sens_support_counts[(sr, dc, mh)])
+        classified_n = int(
+            sum(counts_i[cid] for cid in COUPLED_CLASSES if cid != 0)
+        )
         for cid, label in COUPLED_CLASSES.items():
-            if cid == 0:
-                continue
+            count = int(counts_i[cid])
             sens_rows.append(
                 {
                     "stable_rate_mm_yr": sr,
@@ -859,11 +1513,21 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
                     "stable_head_change_m_yr": stable_head,
                     "meaningful_head_change_m_yr": mh,
                     "sample_stride": sensitivity_stride,
+                    "support_sample_pixel_count": support_n,
+                    "classified_sample_pixel_count": classified_n,
+                    "classified_fraction_of_support": (
+                        classified_n / support_n if support_n else np.nan
+                    ),
                     "class_id": cid,
                     "class_label": label,
-                    "sample_pixel_count": int(counts[cid]),
-                    "sample_fraction": (
-                        float(counts[cid]) / total if total else np.nan
+                    "sample_pixel_count": count,
+                    "sample_fraction_of_support": (
+                        count / support_n if support_n else np.nan
+                    ),
+                    "sample_fraction_of_classified": (
+                        count / classified_n
+                        if cid != 0 and classified_n
+                        else np.nan
                     ),
                 }
             )
@@ -871,20 +1535,31 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         out_dir / "evolution_threshold_sensitivity.csv", index=False
     )
 
-    interval_pairs = [tuple(map(int, label.split("_"))) for label in common_labels]
-    _write_well_same_season_table(
-        cfg,
-        interval_pairs,
-        start_month,
-        end_month,
-        max_day_diff,
-        min_pairs,
-        out_dir / "well_same_season_head_change.csv",
+    cross_rows: list[dict[str, Any]] = []
+    for gid, glabel in GROUNDWATER_STATES.items():
+        for did, dlabel in DEFORMATION_CLASSES.items():
+            count = int(cross_counts[(gid, did)])
+            area = float(cross_area[(gid, did)])
+            cross_rows.append(
+                {
+                    "groundwater_state_id": gid,
+                    "groundwater_state": glabel,
+                    "deformation_class_id": did,
+                    "deformation_class": dlabel,
+                    "pixel_count": count,
+                    "area_km2": area / 1e6,
+                    "fraction_of_support_pixels": (
+                        count / support_count if support_count else np.nan
+                    ),
+                }
+            )
+    pd.DataFrame(cross_rows).to_csv(
+        out_dir / "groundwater_deformation_cross_tab.csv", index=False
     )
 
     result = {
         "status": "ok",
-        "method": "same_season_interannual_observation_first_classification",
+        "method": "same_season_interannual_observation_first_trajectory_classification",
         "analysis_years": [start_year, end_year],
         "same_season_months": [start_month, end_month],
         "max_pair_day_diff": max_day_diff,
@@ -892,6 +1567,9 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         "common_intervals": common_labels,
         "early_intervals": early_labels,
         "late_intervals": late_labels,
+        "recovery_intervals": recovery_labels,
+        "recent_intervals": recent_labels,
+        "recent_decline_min_intervals": recent_decline_min_intervals,
         "thresholds": {
             "stable_rate_mm_yr": stable_rate,
             "meaningful_rate_change_mm_yr": meaningful_change,
@@ -899,9 +1577,13 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
             "meaningful_head_change_m_yr": meaningful_head,
         },
         "support_mask": support_name,
+        "support_pixel_count": int(support_count),
+        "support_area_km2": float(support_area) / 1e6,
+        "groundwater_change_interpolation": groundwater_interp,
         "classification_inputs": [
             "same-season interannual InSAR deformation rate",
-            "same-season interannual groundwater-head change",
+            "directly interpolated same-season well groundwater-head change",
+            "prior recovery and recent trajectory metrics",
         ],
         "classification_excludes": [
             "Ske",
@@ -910,10 +1592,21 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
         ],
         "outputs": {
             "deformation_mode": str(out_dir / "deformation_evolution_mode.tif"),
+            "recent_groundwater_state": str(out_dir / "groundwater_recent_state.tif"),
             "coupled_mode": str(out_dir / "coupled_evolution_mode.tif"),
             "summary": str(out_dir / "evolution_mode_summary.csv"),
-            "threshold_sensitivity": str(out_dir / "evolution_threshold_sensitivity.csv"),
-            "well_same_season_head_change": str(out_dir / "well_same_season_head_change.csv"),
+            "threshold_sensitivity": str(
+                out_dir / "evolution_threshold_sensitivity.csv"
+            ),
+            "groundwater_deformation_cross_tab": str(
+                out_dir / "groundwater_deformation_cross_tab.csv"
+            ),
+            "groundwater_change_spatial_cv": str(
+                out_dir / "groundwater_change_spatial_cv.csv"
+            ),
+            "well_same_season_head_change": str(
+                out_dir / "well_same_season_head_change.csv"
+            ),
         },
     }
     write_json(out_dir / "evolution_summary.json", result)

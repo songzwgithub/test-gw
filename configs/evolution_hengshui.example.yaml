@@ -1,16 +1,16 @@
 # Merge this section into the Hengshui project YAML.
-# The stage can also run with defaults; these values freeze the paper workflow.
+# These values freeze the observation-first evolution workflow.
 evolution:
   start_year: 2018
   end_year: 2025
 
-  # Compare only the same seasonal window so the annual cycle largely cancels.
+  # Compare only the common January-August seasonal window.
   same_season_months: [1, 8]
   max_pair_day_diff: 18
   min_pairs_per_interval: 3
   min_valid_intervals: 4
 
-  # Early vs late evolution windows used for physically interpretable classes.
+  # Early/late windows retain the long-term deformation comparison.
   early_intervals:
     - [2018, 2019]
     - [2019, 2020]
@@ -20,20 +20,47 @@ evolution:
     - [2023, 2024]
     - [2024, 2025]
 
+  # Groundwater recovery history and recent trajectory are kept separate.
+  recovery_intervals:
+    - [2020, 2021]
+    - [2021, 2022]
+  recent_intervals:
+    - [2022, 2023]
+    - [2023, 2024]
+    - [2024, 2025]
+  min_recovery_intervals: 1
+  min_recent_intervals: 2
+  recent_decline_min_intervals: 2
+
   # Deformation: positive=uplift, negative=subsidence.
   stable_rate_mm_yr: 5.0
   meaningful_rate_change_mm_yr: 5.0
 
-  # Groundwater head: positive=head recovery, negative=head decline.
+  # Groundwater head: positive=recovery, negative=decline.
   stable_head_change_m_yr: 0.5
   meaningful_head_change_m_yr: 1.0
 
-  # Restrict hydro-mechanical classification to supported groundwater field.
+  # Direct spatial interpolation of well-based annual head changes.
+  # Candidate settings are explicit here for reproducibility; when omitted,
+  # they inherit the groundwater_field RBF/CV settings.
+  groundwater_interpolation:
+    max_centers: 32
+    sigma_km_candidates: [10.0, 15.0, 20.0, 25.0]
+    ridge_candidates: [0.1, 0.3, 0.6, 1.0]
+    folds: 5
+    block_km: 30.0
+    random_state: 20260919
+    min_wells_per_interval: 8
+    max_nearest_well_km: null
+
+  # Coupled classification is restricted to the supported groundwater domain.
   support_mask: high_confidence
   block_size: 256
 
-  # Sensitivity is evaluated on a spatially thinned sample; it does not alter
-  # the primary class map.
+  # Existing deformation interval maps are reused when present.
+  reuse_existing_deformation_maps: true
+
+  # Sensitivity uses the fixed support denominator and includes class 0.
   sensitivity:
     stable_rate_mm_yr: [3.0, 5.0, 10.0]
     meaningful_rate_change_mm_yr: [3.0, 5.0, 10.0]

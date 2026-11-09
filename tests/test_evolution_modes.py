@@ -5,8 +5,9 @@ import numpy as np
 from hydrogeo_insar.evolution.modes import (
     _nan_slope,
     build_same_season_pairs,
-    classify_coupled_arrays,
     classify_deformation_arrays,
+    classify_groundwater_state_array,
+    classify_trajectory_arrays,
 )
 
 
@@ -29,7 +30,7 @@ def test_same_season_pairing_is_one_to_one_and_near_anniversary():
     assert max(abs(p["anniversary_offset_days"]) for p in pairs) <= 1
 
 
-def test_deformation_and_coupled_evolution_classes():
+def test_deformation_evolution_classes():
     early = np.asarray([[-10.0, -10.0, -10.0, -10.0, 0.0]])
     late = np.asarray([[-10.0, -20.0, -4.0, -2.0, 0.0]])
     change = late - early
@@ -43,16 +44,39 @@ def test_deformation_and_coupled_evolution_classes():
     )
     assert deformation.tolist() == [[2, 3, 5, 5, 1]]
 
-    head_late = np.asarray([[-2.0, 2.0, 2.0, 2.0, 0.0]])
-    coupled = classify_coupled_arrays(
-        head_late,
-        deformation,
-        late,
+
+def test_groundwater_state_preserves_transition_zone():
+    head = np.asarray([[-2.0, -0.8, -0.2, 0.8, 2.0, np.nan]])
+    state = classify_groundwater_state_array(
+        head,
+        stable_head_change_m_yr=0.5,
+        meaningful_head_change_m_yr=1.0,
+    )
+    assert state.tolist() == [[1, 0, 2, 0, 3, 0]]
+
+
+def test_coupled_trajectory_classes_are_mutually_interpretable():
+    recovery = np.asarray([[0.0, 2.0, 2.0, 2.0, 2.0, 0.0]])
+    recent_head = np.asarray([[-2.0, 0.0, 0.0, 0.0, -2.0, 0.0]])
+    decline_count = np.asarray([[2.0, 0.0, 0.0, 0.0, 2.0, 0.0]])
+    deformation_mode = np.asarray([[2, 4, 2, 3, 3, 1]], dtype="uint8")
+    late_rate = np.asarray([[-20.0, -8.0, -15.0, -25.0, -25.0, 0.0]])
+    recent_change = np.asarray([[0.0, 10.0, 0.0, -20.0, -20.0, 0.0]])
+
+    coupled = classify_trajectory_arrays(
+        recovery,
+        recent_head,
+        decline_count,
+        deformation_mode,
+        late_rate,
+        recent_change,
         stable_head_change_m_yr=0.5,
         meaningful_head_change_m_yr=1.0,
         stable_rate_mm_yr=5.0,
+        meaningful_rate_change_mm_yr=5.0,
+        recent_decline_min_intervals=2,
     )
-    assert coupled.tolist() == [[1, 4, 2, 2, 5]]
+    assert coupled.tolist() == [[1, 2, 3, 4, 5, 6]]
 
 
 def test_nan_slope_handles_pixelwise_missing_intervals():
