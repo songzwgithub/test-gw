@@ -6,6 +6,7 @@ from typing import Any
 from .config import ProjectConfig
 from .deformation.decompose import decompose_insar
 from .deformation.regimes import classify_deformation
+from .evolution.modes import compute_evolution_modes
 from .extensometer.analysis import analyze_extensometer
 from .groundwater.field import build_groundwater_field
 from .hydromechanics.lag import estimate_lag
@@ -24,6 +25,7 @@ CORE_STAGES = OrderedDict([
     ("prepare-insar", prepare_insar),
     ("prepare-groundwater", prepare_groundwater),
     ("build-groundwater-field", build_groundwater_field),
+    ("evolution-modes", compute_evolution_modes),
     ("decompose-insar", decompose_insar),
     ("joint-harmonics", compute_joint_harmonics),
     ("estimate-lag", estimate_lag),

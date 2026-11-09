@@ -1,0 +1,41 @@
+# Merge this section into the Hengshui project YAML.
+# The stage can also run with defaults; these values freeze the paper workflow.
+evolution:
+  start_year: 2018
+  end_year: 2025
+
+  # Compare only the same seasonal window so the annual cycle largely cancels.
+  same_season_months: [1, 8]
+  max_pair_day_diff: 18
+  min_pairs_per_interval: 3
+  min_valid_intervals: 4
+
+  # Early vs late evolution windows used for physically interpretable classes.
+  early_intervals:
+    - [2018, 2019]
+    - [2019, 2020]
+    - [2020, 2021]
+  late_intervals:
+    - [2022, 2023]
+    - [2023, 2024]
+    - [2024, 2025]
+
+  # Deformation: positive=uplift, negative=subsidence.
+  stable_rate_mm_yr: 5.0
+  meaningful_rate_change_mm_yr: 5.0
+
+  # Groundwater head: positive=head recovery, negative=head decline.
+  stable_head_change_m_yr: 0.5
+  meaningful_head_change_m_yr: 1.0
+
+  # Restrict hydro-mechanical classification to supported groundwater field.
+  support_mask: high_confidence
+  block_size: 256
+
+  # Sensitivity is evaluated on a spatially thinned sample; it does not alter
+  # the primary class map.
+  sensitivity:
+    stable_rate_mm_yr: [3.0, 5.0, 10.0]
+    meaningful_rate_change_mm_yr: [3.0, 5.0, 10.0]
+    meaningful_head_change_m_yr: [0.5, 1.0, 1.5]
+    sample_stride: 8
