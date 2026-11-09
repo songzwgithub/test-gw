@@ -791,6 +791,193 @@ def _select_groundwater_change_model(
     return best, ordered
 
 
+
+def _safe_pearson_r(actual: np.ndarray, predicted: np.ndarray) -> float:
+    actual = np.asarray(actual, dtype=float)
+    predicted = np.asarray(predicted, dtype=float)
+    ok = np.isfinite(actual) & np.isfinite(predicted)
+    if int(ok.sum()) < 3:
+        return np.nan
+    a = actual[ok]
+    p = predicted[ok]
+    if np.nanstd(a) <= 1e-12 or np.nanstd(p) <= 1e-12:
+        return np.nan
+    return float(np.corrcoef(a, p)[0, 1])
+
+
+def _groundwater_change_oof_audit(
+    frame: pd.DataFrame,
+    labels: list[str],
+    settings: dict[str, Any],
+    best: dict[str, Any],
+    stable_head: float,
+    meaningful_head: float,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    # Station-level out-of-fold predictions and interval diagnostics.
+    prediction_rows: list[dict[str, Any]] = []
+    min_wells = int(settings["min_wells_per_interval"])
+    sigma_m = float(best["sigma_km"]) * 1000.0
+    ridge = float(best["ridge"])
+
+    for label in labels:
+        y1, y2 = map(int, label.split("_"))
+        g = frame[
+            (frame["year1"] == y1)
+            & (frame["year2"] == y2)
+        ].copy()
+        g = g[np.isfinite(g["head_change_m_yr"])].reset_index(drop=True)
+        if len(g) < min_wells:
+            continue
+
+        xy = g[["x", "y"]].to_numpy(float)
+        actual = g["head_change_m_yr"].to_numpy(float)
+        folds = _spatial_fold_ids(
+            xy,
+            n_folds=min(int(settings["folds"]), len(g)),
+            block_km=float(settings["block_km"]),
+            random_state=int(settings["random_state"]),
+        )
+
+        predicted = np.full(len(g), np.nan, dtype=float)
+        used_fold = np.full(len(g), -1, dtype=int)
+
+        for fold in np.unique(folds):
+            test = folds == fold
+            train = ~test
+            if int(train.sum()) < 4 or int(test.sum()) == 0:
+                continue
+
+            centers, coef = _fit_rbf_scalar(
+                xy[train],
+                actual[train],
+                sigma_m,
+                ridge,
+                int(settings["max_centers"]),
+            )
+            predicted[test] = _predict_rbf_scalar(
+                xy[test],
+                centers,
+                sigma_m,
+                coef,
+            )
+            used_fold[test] = int(fold)
+
+        actual_state = classify_groundwater_state_array(
+            actual,
+            stable_head,
+            meaningful_head,
+        )
+        predicted_state = classify_groundwater_state_array(
+            predicted,
+            stable_head,
+            meaningful_head,
+        )
+
+        for i, row in g.iterrows():
+            if not np.isfinite(predicted[i]):
+                continue
+            prediction_rows.append(
+                {
+                    "station_id": str(row["station_id"]),
+                    "year1": int(y1),
+                    "year2": int(y2),
+                    "lon": float(row["lon"]),
+                    "lat": float(row["lat"]),
+                    "fold": int(used_fold[i]),
+                    "actual_head_change_m_yr": float(actual[i]),
+                    "predicted_head_change_m_yr": float(predicted[i]),
+                    "error_m_yr": float(predicted[i] - actual[i]),
+                    "actual_state_id": int(actual_state[i]),
+                    "actual_state": GROUNDWATER_STATES[int(actual_state[i])],
+                    "predicted_state_id": int(predicted_state[i]),
+                    "predicted_state": GROUNDWATER_STATES[int(predicted_state[i])],
+                }
+            )
+
+    predictions = pd.DataFrame(prediction_rows)
+    if predictions.empty:
+        raise ValueError(
+            "Groundwater-change out-of-fold audit produced no valid predictions"
+        )
+
+    interval_rows: list[dict[str, Any]] = []
+    for (y1, y2), g in predictions.groupby(["year1", "year2"], sort=True):
+        actual = g["actual_head_change_m_yr"].to_numpy(float)
+        predicted = g["predicted_head_change_m_yr"].to_numpy(float)
+        error = predicted - actual
+        actual_state = g["actual_state_id"].to_numpy(int)
+        predicted_state = g["predicted_state_id"].to_numpy(int)
+        decisive = actual_state > 0
+
+        interval_rows.append(
+            {
+                "year1": int(y1),
+                "year2": int(y2),
+                "n_validation": int(len(g)),
+                "n_decisive_state": int(decisive.sum()),
+                "actual_median_m_yr": float(np.nanmedian(actual)),
+                "predicted_median_m_yr": float(np.nanmedian(predicted)),
+                "median_difference_m_yr": float(
+                    np.nanmedian(predicted) - np.nanmedian(actual)
+                ),
+                "cv_rmse_m_yr": float(np.sqrt(np.mean(error**2))),
+                "cv_mae_m_yr": float(np.mean(np.abs(error))),
+                "cv_bias_m_yr": float(np.mean(error)),
+                "pearson_r": _safe_pearson_r(actual, predicted),
+                "state_accuracy": (
+                    float(
+                        np.mean(
+                            predicted_state[decisive]
+                            == actual_state[decisive]
+                        )
+                    )
+                    if decisive.any()
+                    else np.nan
+                ),
+            }
+        )
+
+    by_interval = pd.DataFrame(interval_rows)
+
+    confusion_rows: list[dict[str, Any]] = []
+    scopes = [("all", None, None, predictions)]
+    scopes.extend(
+        (
+            "interval",
+            int(y1),
+            int(y2),
+            g.copy(),
+        )
+        for (y1, y2), g in predictions.groupby(["year1", "year2"], sort=True)
+    )
+
+    for scope, y1, y2, g in scopes:
+        for actual_id, actual_label in GROUNDWATER_STATES.items():
+            ga = g[g["actual_state_id"] == actual_id]
+            denom = int(len(ga))
+            for predicted_id, predicted_label in GROUNDWATER_STATES.items():
+                count = int((ga["predicted_state_id"] == predicted_id).sum())
+                confusion_rows.append(
+                    {
+                        "scope": scope,
+                        "year1": y1,
+                        "year2": y2,
+                        "actual_state_id": int(actual_id),
+                        "actual_state": actual_label,
+                        "predicted_state_id": int(predicted_id),
+                        "predicted_state": predicted_label,
+                        "count": count,
+                        "actual_state_count": denom,
+                        "fraction_of_actual_state": (
+                            count / denom if denom else np.nan
+                        ),
+                    }
+                )
+
+    confusion = pd.DataFrame(confusion_rows)
+    return predictions, by_interval, confusion
+
+
 def _fit_interval_groundwater_models(
     frame: pd.DataFrame,
     labels: list[str],
@@ -860,6 +1047,27 @@ def _write_groundwater_change_maps(
         meaningful_head,
     )
     cv_table.to_csv(out_dir.parent / "groundwater_change_spatial_cv.csv", index=False)
+
+    cv_predictions, cv_by_interval, cv_confusion = _groundwater_change_oof_audit(
+        projected,
+        labels,
+        settings,
+        best,
+        stable_head,
+        meaningful_head,
+    )
+    cv_predictions.to_csv(
+        out_dir.parent / "groundwater_change_cv_predictions.csv",
+        index=False,
+    )
+    cv_by_interval.to_csv(
+        out_dir.parent / "groundwater_change_spatial_cv_by_interval.csv",
+        index=False,
+    )
+    cv_confusion.to_csv(
+        out_dir.parent / "groundwater_change_state_confusion.csv",
+        index=False,
+    )
 
     models, interval_summary = _fit_interval_groundwater_models(
         projected,
@@ -966,6 +1174,22 @@ def _write_groundwater_change_maps(
         "max_centers": int(settings["max_centers"]),
         "min_wells_per_interval": int(settings["min_wells_per_interval"]),
         "max_nearest_well_km": settings.get("max_nearest_well_km"),
+        "oof_interval_count": int(len(cv_by_interval)),
+        "oof_interval_cv_rmse_m_yr_min": float(
+            cv_by_interval["cv_rmse_m_yr"].min()
+        ),
+        "oof_interval_cv_rmse_m_yr_max": float(
+            cv_by_interval["cv_rmse_m_yr"].max()
+        ),
+        "oof_interval_state_accuracy_min": float(
+            cv_by_interval["state_accuracy"].min()
+        ),
+        "oof_interval_state_accuracy_max": float(
+            cv_by_interval["state_accuracy"].max()
+        ),
+        "oof_interval_pearson_r_median": float(
+            cv_by_interval["pearson_r"].median()
+        ),
     }
     write_json(out_dir.parent / "groundwater_change_interpolation_summary.json", summary)
     return paths, state_paths, summary
@@ -1603,6 +1827,15 @@ def compute_evolution_modes(cfg: ProjectConfig) -> dict[str, Any]:
             ),
             "groundwater_change_spatial_cv": str(
                 out_dir / "groundwater_change_spatial_cv.csv"
+            ),
+            "groundwater_change_spatial_cv_by_interval": str(
+                out_dir / "groundwater_change_spatial_cv_by_interval.csv"
+            ),
+            "groundwater_change_cv_predictions": str(
+                out_dir / "groundwater_change_cv_predictions.csv"
+            ),
+            "groundwater_change_state_confusion": str(
+                out_dir / "groundwater_change_state_confusion.csv"
             ),
             "well_same_season_head_change": str(
                 out_dir / "well_same_season_head_change.csv"
