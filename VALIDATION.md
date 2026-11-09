@@ -1,55 +1,69 @@
-# v0.3.1 validation
+# v0.4.1 validation
 
-Validation uses the reproducible end-to-end synthetic case in:
+The publication workflow is validated with the reproducible end-to-end
+synthetic case in:
 
 ```text
 tests/integration/test_full_pipeline.py
 ```
 
-Synthetic truth includes:
+The synthetic truth contains:
 
 - common-reference cumulative vertical InSAR GeoTIFFs;
 - daily confined-head observations at 12 wells;
 - spatially varying annual groundwater forcing;
-- deformation response lag = **50 days**;
-- spatially constant effective elastic skeletal storativity = **0.002**;
-- two different long-term deformation regimes;
-- known piecewise-linear irreversible deformation, allowing analytical IGWS truth.
+- deformation-response lag of 50 days;
+- spatially constant pixelwise effective elastic skeletal storage coefficient
+  `Ske = 0.002`;
+- known piecewise-linear irreversible deformation.
 
-Latest local v0.3.1 run recovered:
-
-```text
-regional lag                         50.0 days
-median Ske                           0.00199583
-groundwater spatial-CV RMSE          0.08391 m
-groundwater annual amplitude RMSE    0.08716 m
-groundwater phase MAE                0.11277 days
-groundwater harmonic-vector CV RMSE  0.08837 m
-Ske CV deformation RMSE              8.00e-05 m
-```
-
-For the final synthetic storage interval:
+The integration test runs through:
 
 ```text
-estimated irreversible GWS change  -1.57937e7 m3
-analytical truth                    -1.57992e7 m3
-relative error                       0.035 %
+prepare-insar
+prepare-groundwater
+build-groundwater-field
+decompose-insar
+joint-harmonics
+estimate-lag
+estimate-ske
+storage-budget
+annual-storage-maps
 ```
 
-Automated tests:
+It checks recovery of the synthetic lag and `Ske`, analytical irreversible
+storage change, the storage identity, finite annual estimates, annual
+GeoTIFF/CSV volume consistency, and result-check plotting.
 
-```text
-6 passed
-```
+In v0.4.1 `storage-budget` writes annual maps during the same temporal-fitting
+pass used for the regional storage budget. `annual-storage-maps` is an
+independent raster reintegration check and does not refit the temporal model.
 
-Run with:
+Run:
 
 ```bash
 PYTHONPATH=src pytest -q
 ```
 
+A release is acceptable only when the complete test suite passes.
 
-Additional v0.3.1 regression checks:
+## Interpretation checks
 
-- long groundwater gaps rejected by the active-well criterion are not bridged by later interpolation;
-- Ske and storage diagnostic plotting complete on the synthetic case.
+The storage partition follows the configured Jiang-style decomposition:
+
+```text
+Delta b_total
+= Delta b_recoverable + Delta b_irreversible
+
+Delta b_recoverable
+= Ske * Delta h_lowfreq
+```
+
+`Ske` is the lag-aligned annual-harmonic scale factor and is reported
+pixelwise. `storage_ske_cosine_sensitivity.csv` reports storage estimates for
+multiple seasonal-vector-cosine support thresholds so the primary product can
+be compared with stricter seasonal-coupling definitions.
+
+Residual/irreversible deformation is an equivalent hydromechanical residual;
+it should not be interpreted as independently proven permanent storage loss
+without hydrostratigraphic or extensometer evidence.

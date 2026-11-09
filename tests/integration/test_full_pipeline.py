@@ -99,7 +99,7 @@ def _make_case(root: Path):
 def test_full_pipeline_recovers_lag_ske_and_irreversible_storage(tmp_path):
     cfg_path, irreversible_mm, transform, crs = _make_case(tmp_path)
     cfg = load_config(cfg_path)
-    result = run_pipeline(cfg, stop="storage-budget")
+    result = run_pipeline(cfg, stop="annual-storage-maps")
 
     assert abs(result["estimate-lag"]["lag_days"] - 50.0) <= 3.0
     assert abs(result["estimate-ske"]["ske_median"] - 0.002) <= 6e-4
@@ -118,6 +118,40 @@ def test_full_pipeline_recovers_lag_ske_and_irreversible_storage(tmp_path):
     annual = pd.read_csv(cfg.outputs / "storage" / "storage_annual_change.csv")
     assert len(annual) >= 3
     assert np.isfinite(annual["irreversible_gws_change_m3"]).all()
+
+    annual_check = pd.read_csv(
+        cfg.outputs / "storage" / "annual_maps_volume_check.csv"
+    )
+    diff_cols = [
+        c for c in annual_check.columns
+        if c.endswith("_difference")
+    ]
+    assert diff_cols
+    scale = max(
+        1.0,
+        float(
+            np.nanmax(
+                np.abs(
+                    annual_check[
+                        [
+                            "total_gws_change_m3_previous",
+                            "recoverable_gws_change_m3_previous",
+                            "irreversible_gws_change_m3_previous",
+                        ]
+                    ].to_numpy(float)
+                )
+            )
+        ),
+    )
+    assert float(
+        np.nanmax(
+            np.abs(
+                annual_check[diff_cols].to_numpy(float)
+            )
+        )
+    ) <= 1e-6 * scale
+
+    assert result["annual-storage-maps"]["status"] == "ok"
 
     ske_plot = plot_stage(cfg, "estimate-ske")
     storage_plot = plot_stage(cfg, "storage-budget")
