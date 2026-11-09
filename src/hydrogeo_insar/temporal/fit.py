@@ -33,18 +33,29 @@ def fit_block(y: np.ndarray, X: np.ndarray, min_obs: int):
     return beta, rmse, n, rss
 
 
-def fit_block_grouped(y: np.ndarray, X: np.ndarray, min_obs: int):
-    """Fast LS grouped by identical temporal-validity masks."""
+def fit_block_grouped(
+    y: np.ndarray,
+    X: np.ndarray,
+    min_obs: int,
+    residual_chunk_pixels: int = 32768,
+):
+    """Fast LS grouped by identical temporal-validity masks.
+
+    The numerical model is unchanged. The implementation avoids full-block
+    float64 copies and full-block residual arrays.
+    """
     y = np.asarray(y)
     X = np.asarray(X, dtype=np.float64)
     if y.ndim != 2 or X.ndim != 2 or X.shape[0] != y.shape[0]:
         raise ValueError("Expected y=(time,pixel), X=(time,param)")
 
-    _, n_pixel = y.shape
+    n_time, n_pixel = y.shape
     n_param = X.shape[1]
     valid = np.isfinite(y)
     n_obs = valid.sum(axis=0).astype(np.int32)
-    good_idx = np.flatnonzero(n_obs >= max(int(min_obs), n_param + 1))
+    good_idx = np.flatnonzero(
+        n_obs >= max(int(min_obs), n_param + 1)
+    )
 
     beta = np.full((n_pixel, n_param), np.nan, dtype=np.float64)
     rmse = np.full(n_pixel, np.nan, dtype=np.float64)
@@ -53,23 +64,67 @@ def fit_block_grouped(y: np.ndarray, X: np.ndarray, min_obs: int):
     if good_idx.size == 0:
         return beta, rmse, n_obs, rss, 0
 
-    packed = np.packbits(valid[:, good_idx].T, axis=1)
-    _, inverse = np.unique(packed, axis=0, return_inverse=True)
-    n_patterns = int(inverse.max()) + 1
+    all_good_fully_valid = bool(
+        np.all(n_obs[good_idx] == n_time)
+    )
 
-    for gid in range(n_patterns):
-        cols = good_idx[inverse == gid]
-        if cols.size == 0:
-            continue
-        mask = valid[:, cols[0]]
+    if all_good_fully_valid:
+        groups = [(good_idx, np.ones(n_time, dtype=bool))]
+        n_patterns = 1
+    else:
+        packed = np.packbits(valid[:, good_idx].T, axis=1)
+        _, inverse = np.unique(packed, axis=0, return_inverse=True)
+        n_patterns = int(inverse.max()) + 1
+        groups = []
+        for gid in range(n_patterns):
+            cols = good_idx[inverse == gid]
+            if cols.size == 0:
+                continue
+            groups.append((cols, valid[:, cols[0]]))
+
+    chunk = max(1, int(residual_chunk_pixels))
+
+    for cols, mask in groups:
         Xm = X[mask]
-        Y = np.asarray(y[np.ix_(mask, cols)], dtype=np.float64)
-        B = np.linalg.pinv(Xm) @ Y
-        beta[cols] = B.T
-        residual = Y - Xm @ B
-        rg = np.einsum("tp,tp->p", residual, residual, optimize=True)
-        rss[cols] = rg
-        rmse[cols] = np.sqrt(rg / int(mask.sum()))
+        pinv = np.linalg.pinv(Xm)
+        n_group_obs = int(mask.sum())
+
+        contiguous_full = (
+            bool(mask.all())
+            and cols.size > 0
+            and np.array_equal(
+                cols,
+                np.arange(
+                    int(cols[0]),
+                    int(cols[0]) + len(cols),
+                    dtype=cols.dtype,
+                ),
+            )
+        )
+
+        for start in range(0, len(cols), chunk):
+            stop = min(start + chunk, len(cols))
+            cc = cols[start:stop]
+
+            if contiguous_full:
+                c0 = int(cc[0])
+                c1 = int(cc[-1]) + 1
+                Y = y[:, c0:c1]
+            else:
+                Y = y[np.ix_(mask, cc)]
+
+            B = pinv @ Y
+            beta[cc] = B.T
+
+            residual = np.asarray(Y, dtype=np.float64) - Xm @ B
+            rg = np.einsum(
+                "tp,tp->p",
+                residual,
+                residual,
+                optimize=True,
+            )
+            rss[cc] = rg
+            rmse[cc] = np.sqrt(rg / n_group_obs)
 
     return beta, rmse, n_obs, rss, n_patterns
 

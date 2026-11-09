@@ -40,3 +40,28 @@ def test_storage_identity():
     recoverable = np.array([0.01, -0.01, 0.02])
     irreversible = total - recoverable
     assert np.allclose(total, recoverable + irreversible)
+
+def test_grouped_fit_all_valid_fast_path_matches_general_fit():
+    rng = np.random.default_rng(123)
+    X = np.column_stack([
+        np.ones(64),
+        np.linspace(-1, 1, 64),
+        np.sin(np.linspace(0, 2*np.pi, 64)),
+        np.cos(np.linspace(0, 2*np.pi, 64)),
+    ])
+    y = rng.normal(size=(64, 257)).astype("float32")
+
+    b0, r0, n0, rss0 = fit_block(y, X, min_obs=12)
+    b1, r1, n1, rss1, npat = fit_block_grouped(
+        y,
+        X,
+        min_obs=12,
+        residual_chunk_pixels=31,
+    )
+
+    assert npat == 1
+    assert np.array_equal(n0, n1)
+    assert np.allclose(b0, b1, atol=1e-9, equal_nan=True)
+    assert np.allclose(r0, r1, atol=1e-9, equal_nan=True)
+    assert np.allclose(rss0, rss1, atol=1e-9, equal_nan=True)
+
